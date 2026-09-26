@@ -400,6 +400,21 @@ class ValOptions(StrictStruct):
     suffix: Annotated[
         str | None, Meta(description="Optional suffix to append to saved filenames.")
     ] = None
+    stochastic_samples: Annotated[
+        int,
+        Meta(
+            description="Number of seeded stochastic generator samples per validation image."
+        ),
+    ] = 1
+    stochastic_seed: Annotated[
+        int, Meta(description="Base seed used for stochastic validation samples.")
+    ] = 0
+    stochastic_selection: Annotated[
+        Literal["first", "best", "worst"],
+        Meta(
+            description="Which sample is used for metrics and the primary saved validation image."
+        ),
+    ] = "first"
 
     metrics_enabled: Annotated[
         bool, Meta(description="Whether to run metrics calculations during validation.")

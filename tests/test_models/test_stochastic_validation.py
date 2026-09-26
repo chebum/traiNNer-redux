@@ -1,0 +1,51 @@
+from types import SimpleNamespace
+
+import torch
+from torch import nn
+from traiNNer.models.sr_model import SRModel
+
+
+class RandomGenerator(nn.Module):
+    def forward(self, value: torch.Tensor) -> torch.Tensor:
+        return value + torch.randn_like(value) * 0.1
+
+
+def test_validation_generates_four_seeds_and_selects_worst() -> None:
+    model = object.__new__(SRModel)
+    model.device = torch.device("cpu")
+    model.amp_dtype = torch.float32
+    model.use_amp = False
+    model.optimizers_schedule_free = []
+    model.net_g = RandomGenerator()
+    model.net_g_ema = None
+    model.lq = torch.ones(1, 3, 8, 8)
+    model.gt = torch.ones_like(model.lq)
+    model.is_train = True
+    model.opt = SimpleNamespace(
+        input_pixel_format="rgb",
+        output_pixel_format="rgb",
+        val=SimpleNamespace(
+            stochastic_samples=4,
+            stochastic_seed=10,
+            stochastic_selection="worst",
+            tile_size=0,
+        ),
+    )
+
+    torch.manual_seed(99)
+    expected_next_random = torch.rand(1)
+    torch.manual_seed(99)
+    SRModel.test(model)
+
+    assert len(model.validation_outputs) == 4
+    assert all(
+        not torch.equal(model.validation_outputs[0], output)
+        for output in model.validation_outputs[1:]
+    )
+    errors = [
+        torch.mean(torch.abs(output - model.gt)).item()
+        for output in model.validation_outputs
+    ]
+    assert torch.equal(model.output, model.validation_outputs[errors.index(max(errors))])
+    # Validation must not disturb the training RNG stream.
+    assert torch.equal(torch.rand(1), expected_next_random)

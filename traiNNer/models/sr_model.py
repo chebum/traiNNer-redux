@@ -875,14 +875,40 @@ class SRModel(BaseModel):
             net.eval()
 
             assert self.opt.val is not None
-            with torch.inference_mode():
-                if self.opt.val.tile_size > 0:
-                    tmp_out = self.infer_tiled(net, lq)
-                else:
-                    tmp_out = net(lq)
-                self.output = pixelformat2rgb_pt(
-                    tmp_out, self.gt, self.opt.output_pixel_format
+            sample_count = self.opt.val.stochastic_samples
+            if sample_count < 1:
+                raise ValueError("val.stochastic_samples must be at least 1")
+            devices = [self.device] if self.device.type == "cuda" else []
+            self.validation_outputs: list[Tensor] = []
+            with torch.inference_mode(), torch.random.fork_rng(devices=devices):
+                for sample_index in range(sample_count):
+                    sample_seed = self.opt.val.stochastic_seed + sample_index
+                    torch.manual_seed(sample_seed)
+                    if self.device.type == "cuda":
+                        torch.cuda.manual_seed_all(sample_seed)
+                    if self.opt.val.tile_size > 0:
+                        tmp_out = self.infer_tiled(net, lq)
+                    else:
+                        tmp_out = net(lq)
+                    self.validation_outputs.append(
+                        pixelformat2rgb_pt(
+                            tmp_out, self.gt, self.opt.output_pixel_format
+                        )
+                    )
+
+            selection = self.opt.val.stochastic_selection
+            selected_index = 0
+            if selection != "first" and self.gt is not None:
+                errors = [
+                    torch.mean(torch.abs(output - self.gt)).item()
+                    for output in self.validation_outputs
+                ]
+                selected_index = (
+                    errors.index(max(errors))
+                    if selection == "worst"
+                    else errors.index(min(errors))
                 )
+            self.output = self.validation_outputs[selected_index]
 
             if self.net_g_ema is None and self.is_train:
                 net.train()
@@ -1028,6 +1054,19 @@ class SRModel(BaseModel):
                         f"{img_name}.png",
                     )
                 imwrite(cv2.cvtColor(sr_img, cv2.COLOR_RGB2BGR), save_img_path)
+                if len(self.validation_outputs) > 1:
+                    save_root, save_ext = osp.splitext(save_img_path)
+                    for sample_index, sample_output in enumerate(
+                        self.validation_outputs
+                    ):
+                        sample_img = tensor2img(sample_output, to_bgr=False)
+                        sample_path = (
+                            f"{save_root}_seed"
+                            f"{self.opt.val.stochastic_seed + sample_index}{save_ext}"
+                        )
+                        imwrite(
+                            cv2.cvtColor(sample_img, cv2.COLOR_RGB2BGR), sample_path
+                        )
                 if (
                     self.opt.is_train
                     and not self.first_val_completed
