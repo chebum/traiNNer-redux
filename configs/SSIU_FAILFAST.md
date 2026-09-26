@@ -1,5 +1,8 @@
 # SSIU stochastic-texture fail-fast session
 
+Both configs select `device: mps` and run in FP32. AMP is intentionally disabled
+because the current training AMP path is CUDA-specific.
+
 The two runs start from the same sharp deterministic checkpoint and differ only
 where necessary to test stochastic texture generation:
 
@@ -9,13 +12,18 @@ where necessary to test stochastic texture generation:
 
 Both run for 15,000 iterations, validate and checkpoint every 1,000 iterations,
 and use a balanced 64-image validation subset (16 per content category). Run
-them on separate GPUs if possible. If only one GPU is available, run them
-sequentially; simultaneous jobs on one GPU make timing and stability harder to
-compare.
+them sequentially on MPS so timing and memory pressure remain comparable.
 
 ```bash
 uv run python train.py -opt configs/train_ssiu_x2_clean_control_failfast.yml
 uv run python train.py -opt configs/train_ssiu_x2_clean_stochastic_failfast.yml
+```
+
+To keep the Mac awake and launch the stochastic run only after the control exits
+successfully:
+
+```bash
+caffeinate -i zsh -c 'uv run python train.py -opt configs/train_ssiu_x2_clean_control_failfast.yml && uv run python train.py -opt configs/train_ssiu_x2_clean_stochastic_failfast.yml'
 ```
 
 ## Early decision points

@@ -2,12 +2,13 @@
 # the texture branch, its two-sample objectives, and multi-seed validation.
 name: 2x_SSIU_clean_stochastic_failfast
 scale: 2
-use_amp: true
-amp_bf16: true
-use_channels_last: true
+use_amp: false
+amp_bf16: false
+use_channels_last: false
 fast_matmul: false
 use_compile: false
 num_gpu: auto
+device: mps
 manual_seed: 1234
 
 datasets:

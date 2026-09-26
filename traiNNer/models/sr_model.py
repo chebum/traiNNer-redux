@@ -27,6 +27,7 @@ from traiNNer.metrics import calculate_metric
 from traiNNer.models.base_model import BaseModel
 from traiNNer.utils import get_root_logger, imwrite, tensor2img
 from traiNNer.utils.color_util import pixelformat2rgb_pt, rgb2pixelformat_pt
+from traiNNer.utils.device import empty_device_cache
 from traiNNer.utils.eco import compute_alpha, eco_synthesize
 from traiNNer.utils.logger import clickable_file_path
 from traiNNer.utils.misc import loss_type_to_label
@@ -87,6 +88,12 @@ class SRModel(BaseModel):
 
         # use amp
         self.use_amp = self.opt.use_amp
+        if self.use_amp and self.device.type != "cuda":
+            get_root_logger().warning(
+                "AMP is currently supported only on CUDA; disabling AMP on %s.",
+                self.device.type.upper(),
+            )
+            self.use_amp = False
         self.use_channels_last = self.opt.use_channels_last
         self.memory_format = (
             torch.channels_last
@@ -133,6 +140,7 @@ class SRModel(BaseModel):
         self.lq: Tensor | None = None
         self.gt: Tensor | None = None
         self.output: Tensor | None = None
+        self.validation_outputs: list[Tensor] = []
         self._real_hr: Tensor | None = None
         logger = get_root_logger()
 
@@ -165,7 +173,7 @@ class SRModel(BaseModel):
                 opt.train.total_iter,
             )
 
-        if self.use_amp:
+        if self.use_amp and self.device.type == "cuda":
             if self.amp_dtype == torch.bfloat16 and not torch.cuda.is_bf16_supported():
                 logger.warning(
                     "bf16 was enabled for AMP but the current GPU does not support bf16. Falling back to float16 for AMP. Disable bf16 to hide this warning (amp_bf16: false)."
@@ -272,7 +280,9 @@ class SRModel(BaseModel):
 
         logger = get_root_logger()
 
-        enable_gradscaler = self.use_amp and not self.opt.amp_bf16
+        enable_gradscaler = (
+            self.device.type == "cuda" and self.use_amp and not self.opt.amp_bf16
+        )
 
         self.scaler_g = GradScaler(enabled=enable_gradscaler, device="cuda")
         self.scaler_d = GradScaler(enabled=enable_gradscaler, device="cuda")
@@ -962,23 +972,38 @@ class SRModel(BaseModel):
             sample_count = self.opt.val.stochastic_samples
             if sample_count < 1:
                 raise ValueError("val.stochastic_samples must be at least 1")
-            devices = [self.device] if self.device.type == "cuda" else []
-            self.validation_outputs: list[Tensor] = []
-            with torch.inference_mode(), torch.random.fork_rng(devices=devices):
-                for sample_index in range(sample_count):
-                    sample_seed = self.opt.val.stochastic_seed + sample_index
-                    torch.manual_seed(sample_seed)
-                    if self.device.type == "cuda":
-                        torch.cuda.manual_seed_all(sample_seed)
-                    if self.opt.val.tile_size > 0:
-                        tmp_out = self.infer_tiled(net, lq)
-                    else:
-                        tmp_out = net(lq)
-                    self.validation_outputs.append(
-                        pixelformat2rgb_pt(
-                            tmp_out, self.gt, self.opt.output_pixel_format
+            self.validation_outputs = []
+            cpu_rng_state = torch.random.get_rng_state()
+            cuda_rng_states = (
+                torch.cuda.get_rng_state_all() if self.device.type == "cuda" else None
+            )
+            mps_rng_state = (
+                torch.mps.get_rng_state() if self.device.type == "mps" else None
+            )
+            try:
+                with torch.inference_mode():
+                    for sample_index in range(sample_count):
+                        sample_seed = self.opt.val.stochastic_seed + sample_index
+                        torch.manual_seed(sample_seed)
+                        if self.device.type == "cuda":
+                            torch.cuda.manual_seed_all(sample_seed)
+                        elif self.device.type == "mps":
+                            torch.mps.manual_seed(sample_seed)
+                        if self.opt.val.tile_size > 0:
+                            tmp_out = self.infer_tiled(net, lq)
+                        else:
+                            tmp_out = net(lq)
+                        self.validation_outputs.append(
+                            pixelformat2rgb_pt(
+                                tmp_out, self.gt, self.opt.output_pixel_format
+                            )
                         )
-                    )
+            finally:
+                torch.random.set_rng_state(cpu_rng_state)
+                if cuda_rng_states is not None:
+                    torch.cuda.set_rng_state_all(cuda_rng_states)
+                if mps_rng_state is not None:
+                    torch.mps.set_rng_state(mps_rng_state)
 
             selection = self.opt.val.stochastic_selection
             selected_index = 0
@@ -1084,7 +1109,7 @@ class SRModel(BaseModel):
             # tentative for out of GPU memory
             self.lq = None
             self.output = None
-            torch.cuda.empty_cache()
+            empty_device_cache(self.device)
 
             save_img_dir = None
 

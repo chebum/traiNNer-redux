@@ -505,6 +505,12 @@ class ReduxOptions(StrictStruct):
         ),
     ]
     path: PathOptions
+    device: Annotated[
+        Literal["auto", "cuda", "mps", "cpu"],
+        Meta(
+            description="Compute device. Use mps for Apple Silicon, cuda for NVIDIA, or cpu. Auto preserves the legacy num_gpu-based selection."
+        ),
+    ] = "auto"
 
     input_pixel_format: Annotated[
         PixelFormat, Meta(description="Input pixel format.")
