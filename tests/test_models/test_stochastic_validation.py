@@ -2,7 +2,7 @@ from types import SimpleNamespace
 
 import torch
 from torch import nn
-from traiNNer.models.sr_model import SRModel
+from traiNNer.models.sr_model import SRModel, _stochastic_frequency_deltas
 
 
 class RandomGenerator(nn.Module):
@@ -49,3 +49,24 @@ def test_validation_generates_four_seeds_and_selects_worst() -> None:
     assert torch.equal(model.output, model.validation_outputs[errors.index(max(errors))])
     # Validation must not disturb the training RNG stream.
     assert torch.equal(torch.rand(1), expected_next_random)
+
+
+def test_detail_weighted_diversity_ignores_flat_targets_and_has_gradients() -> None:
+    first = torch.zeros(1, 3, 8, 8, requires_grad=True)
+    second = torch.randn(1, 3, 8, 8, requires_grad=True) * 0.01
+    flat_target = torch.zeros_like(first)
+    _, global_delta, flat_detail_delta = _stochastic_frequency_deltas(
+        first, second, flat_target, 5, 0.01
+    )
+    assert global_delta > 0
+    assert flat_detail_delta == 0
+
+    textured_target = torch.zeros_like(first)
+    textured_target[:, :, ::2, ::2] = 1
+    _, _, detail_delta = _stochastic_frequency_deltas(
+        first, second, textured_target, 5, 0.01
+    )
+    assert detail_delta > 0
+    detail_delta.backward()
+    assert first.grad is not None
+    assert torch.count_nonzero(first.grad) > 0

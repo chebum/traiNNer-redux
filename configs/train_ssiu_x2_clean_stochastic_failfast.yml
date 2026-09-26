@@ -1,0 +1,133 @@
+# Fail-fast stochastic SSIU run. Differences from the control are limited to
+# the texture branch, its two-sample objectives, and multi-seed validation.
+name: 2x_SSIU_clean_stochastic_failfast
+scale: 2
+use_amp: true
+amp_bf16: true
+use_channels_last: true
+fast_matmul: false
+use_compile: false
+num_gpu: auto
+manual_seed: 1234
+
+datasets:
+  train:
+    name: Clean mined train
+    type: pairedimagedataset
+    dataroot_gt:
+      - datasets/mined_hr_512_text/train/text
+      - datasets/mined_hr_512_photo/train/photo
+      - datasets/mined_hr_512_nature/train/nature
+      - datasets/mined_hr_512_anime/train/anime
+    dataroot_lq:
+      - datasets/mined_lq_x2_text/train/text
+      - datasets/mined_lq_x2_photo/train/photo
+      - datasets/mined_lq_x2_nature/train/nature
+      - datasets/mined_lq_x2_anime/train/anime
+    lq_size: 128
+    use_hflip: true
+    use_rot: true
+    num_worker_per_gpu: 8
+    batch_size_per_gpu: 8
+    accum_iter: 1
+  val_text:
+    name: Clean text fail-fast val
+    type: pairedimagedataset
+    dataroot_gt: [datasets/mined_hr_512_text/val/text]
+    dataroot_lq: [datasets/mined_lq_x2_text/val/text]
+    max_dataset_size: 16
+  val_photo:
+    name: Clean photo fail-fast val
+    type: pairedimagedataset
+    dataroot_gt: [datasets/mined_hr_512_photo/val/photo]
+    dataroot_lq: [datasets/mined_lq_x2_photo/val/photo]
+    max_dataset_size: 16
+  val_nature:
+    name: Clean nature fail-fast val
+    type: pairedimagedataset
+    dataroot_gt: [datasets/mined_hr_512_nature/val/nature]
+    dataroot_lq: [datasets/mined_lq_x2_nature/val/nature]
+    max_dataset_size: 16
+  val_anime:
+    name: Clean anime fail-fast val
+    type: pairedimagedataset
+    dataroot_gt: [datasets/mined_hr_512_anime/val/anime]
+    dataroot_lq: [datasets/mined_lq_x2_anime/val/anime]
+    max_dataset_size: 16
+
+network_g:
+  type: SSIU
+  colors: 3
+  n_feats: 64
+  n_blocks: 9
+  stochastic: true
+  noise_channels: 8
+  noise_mode: always
+  highpass_kernel: 5
+  texture_init_std: !!float 1e-5
+
+path:
+  pretrain_network_g: /Users/ivannikitin/PycharmProjects/AI_watermark_worker/models/SSIU/SSIU-x2-clean70-jpeg30-perceptual.safetensors
+  param_key_g: ~
+  # Only texture_head.* may be missing from the deterministic checkpoint.
+  strict_load_g: false
+  resume_state: ~
+
+train:
+  ema_decay: 0.999
+  ema_power: 0.75
+  grad_clip: true
+  grad_clip_max_norm: 1.0
+  stochastic_second_pass: true
+  # 0.5/255 target: enough to expose collapse without immediately rewarding grain.
+  stochastic_diversity_target: 0.0019607843
+  # Only reward seed variation where GT itself contains edges or texture.
+  stochastic_detail_threshold: 0.01
+  stochastic_diversity_weight: 0.1
+  stochastic_low_frequency_weight: 0.05
+  stochastic_filter_size: 5
+  optim_g:
+    type: AdamW
+    lr: !!float 2e-5
+    weight_decay: 0
+    betas: [0.9, 0.99]
+  scheduler:
+    type: MultiStepLR
+    milestones: [8000, 12000]
+    gamma: 0.5
+  total_iter: 15000
+  warmup_iter: 500
+  losses:
+    - type: charbonnierloss
+      loss_weight: 1.0
+    - type: fftloss
+      loss_weight: 0.03
+    - type: perceptualloss
+      criterion: charbonnier
+      loss_weight: 0.01
+
+val:
+  val_enabled: true
+  val_freq: 1000
+  save_img: true
+  tile_size: 0
+  tile_overlap: 0
+  stochastic_samples: 4
+  stochastic_seed: 0
+  stochastic_selection: first
+  metrics_enabled: true
+  metrics:
+    psnr:
+      type: calculate_psnr
+      crop_border: 2
+      test_y_channel: false
+    ssim:
+      type: calculate_ssim
+      crop_border: 2
+      test_y_channel: false
+
+logger:
+  print_freq: 100
+  save_checkpoint_freq: 1000
+  save_checkpoint_format: safetensors
+  use_tb_logger: true

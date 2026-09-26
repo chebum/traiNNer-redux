@@ -34,6 +34,49 @@ from traiNNer.utils.redux_options import ReduxOptions
 from traiNNer.utils.types import DataFeed
 
 
+def _stochastic_frequency_deltas(
+    first: Tensor,
+    second: Tensor,
+    target: Tensor,
+    filter_size: int,
+    detail_threshold: float,
+) -> tuple[Tensor, Tensor, Tensor]:
+    """Return low-frequency, global high-frequency, and detail-weighted deltas."""
+    if filter_size < 3 or filter_size % 2 == 0:
+        raise ValueError(
+            "train.stochastic_filter_size must be an odd integer of at least 3"
+        )
+    if detail_threshold <= 0:
+        raise ValueError(
+            "train.stochastic_detail_threshold must be greater than zero"
+        )
+    filter_radius = filter_size // 2
+    padding = (filter_radius,) * 4
+
+    def low_pass(value: Tensor) -> Tensor:
+        return F.avg_pool2d(
+            F.pad(value, padding, mode="reflect"), filter_size, stride=1
+        )
+
+    first_low = low_pass(first)
+    second_low = low_pass(second)
+    low_delta = F.l1_loss(first_low, second_low)
+    high_difference = torch.abs(
+        (first - first_low) - (second - second_low)
+    )
+    high_delta = high_difference.mean()
+    target_low = low_pass(target)
+    detail_weight = (
+        torch.abs(target - target_low).mean(dim=1, keepdim=True)
+        / detail_threshold
+    ).clamp(max=1)
+    detail_weight_sum = detail_weight.sum().clamp_min(1e-6)
+    detail_high_delta = (high_difference * detail_weight).sum() / (
+        detail_weight_sum * high_difference.shape[1]
+    )
+    return low_delta, high_delta, detail_high_delta
+
+
 class SRModel(BaseModel):
     """Base SR model for single image super-resolution."""
 
@@ -553,6 +596,8 @@ class SRModel(BaseModel):
         assert self.gt is not None
         assert self.scaler_d is not None
         assert self.scaler_g is not None
+        train_opt = self.opt.train
+        assert train_opt is not None
 
         skip_d_update = False
 
@@ -655,6 +700,45 @@ class SRModel(BaseModel):
                         weighted_l_g_loss = l_g_loss * abs(loss.loss_weight)
                         l_g_total += weighted_l_g_loss / self.accum_iters
                         loss_dict[label] = weighted_l_g_loss
+
+                if train_opt.stochastic_second_pass:
+                    filter_size = train_opt.stochastic_filter_size
+                    second_output = pixelformat2rgb_pt(
+                        self.net_g(lq), self.gt, self.opt.output_pixel_format
+                    )
+                    low_delta, high_delta, detail_high_delta = (
+                        _stochastic_frequency_deltas(
+                            self.output,
+                            second_output,
+                            self.gt,
+                            filter_size,
+                            train_opt.stochastic_detail_threshold,
+                        )
+                    )
+                    loss_dict["stochastic_hf_delta"] = high_delta.detach()
+                    loss_dict["stochastic_detail_hf_delta"] = (
+                        detail_high_delta.detach()
+                    )
+                    loss_dict["stochastic_lf_delta"] = low_delta.detach()
+
+                    if train_opt.stochastic_diversity_weight > 0:
+                        diversity_loss = F.relu(
+                            high_delta.new_tensor(
+                                train_opt.stochastic_diversity_target
+                            )
+                            - detail_high_delta
+                        ) * train_opt.stochastic_diversity_weight
+                        l_g_total += diversity_loss / self.accum_iters
+                        loss_dict["l_g_stochastic_diversity"] = diversity_loss
+
+                    if train_opt.stochastic_low_frequency_weight > 0:
+                        low_frequency_loss = (
+                            low_delta * train_opt.stochastic_low_frequency_weight
+                        )
+                        l_g_total += low_frequency_loss / self.accum_iters
+                        loss_dict["l_g_stochastic_low_frequency"] = (
+                            low_frequency_loss
+                        )
 
                 if not l_g_total.isfinite():
                     self.nan_count += 1
