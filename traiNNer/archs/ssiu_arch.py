@@ -1,8 +1,10 @@
 """Structural Similarity-Inspired Unfolding (SSIU) for image SR.
 
 The deterministic module names match the locally deployed SSIU checkpoints.
-The optional stochastic path is a zero-initialized, high-pass texture residual,
-so enabling it does not change the pretrained model's initial output.
+The optional stochastic paths are initialized to preserve the pretrained
+model's output.  The legacy texture head adds a high-pass RGB residual, while
+deep feature noise gives late SSIU blocks spatial randomness that they can
+turn into structured texture.
 """
 
 from __future__ import annotations
@@ -20,6 +22,35 @@ from traiNNer.utils.registry import ARCH_REGISTRY
 NoiseMode = Literal["train", "always", "disabled"]
 
 
+class LearnedFeatureNoise(nn.Module):
+    """Add spatial Gaussian noise with a learned gain for every feature."""
+
+    def __init__(
+        self,
+        *,
+        channels: int,
+        noise_mode: NoiseMode,
+        init_gain: float,
+    ) -> None:
+        super().__init__()
+        if noise_mode not in ("train", "always", "disabled"):
+            raise ValueError(f"Unsupported noise_mode: {noise_mode}")
+        if init_gain < 0:
+            raise ValueError("feature_noise_init_gain must be non-negative")
+        self.noise_mode = noise_mode
+        self.gain = nn.Parameter(
+            torch.full((1, channels, 1, 1), float(init_gain))
+        )
+
+    def forward(self, features: Tensor) -> Tensor:
+        enabled = self.noise_mode == "always" or (
+            self.noise_mode == "train" and self.training
+        )
+        if not enabled:
+            return features
+        return features + torch.randn_like(features) * self.gain
+
+
 class StochasticTextureHead(nn.Module):
     """Predict a zero-mean HR texture residual from features and spatial noise."""
 
@@ -30,6 +61,7 @@ class StochasticTextureHead(nn.Module):
         out_channels: int,
         scale: int,
         noise_channels: int,
+        noise_scale: int,
         noise_mode: NoiseMode,
         highpass_kernel: int,
         init_std: float,
@@ -37,9 +69,12 @@ class StochasticTextureHead(nn.Module):
         super().__init__()
         if noise_mode not in ("train", "always", "disabled"):
             raise ValueError(f"Unsupported noise_mode: {noise_mode}")
+        if noise_scale < 1:
+            raise ValueError("noise_scale must be at least 1")
         if highpass_kernel < 3 or highpass_kernel % 2 == 0:
             raise ValueError("highpass_kernel must be an odd integer of at least 3")
         self.noise_channels = noise_channels
+        self.noise_scale = noise_scale
         self.noise_mode = noise_mode
         self.highpass_kernel = highpass_kernel
         self.out_channels = out_channels
@@ -73,13 +108,22 @@ class StochasticTextureHead(nn.Module):
                 height * self.scale,
                 width * self.scale,
             )
+        height, width = features.shape[-2:]
         noise = torch.randn(
             features.shape[0],
             self.noise_channels,
-            *features.shape[-2:],
+            math.ceil(height / self.noise_scale),
+            math.ceil(width / self.noise_scale),
             device=features.device,
             dtype=features.dtype,
         )
+        if self.noise_scale > 1:
+            noise = F.interpolate(
+                noise,
+                size=(height, width),
+                mode="bilinear",
+                align_corners=False,
+            )
         residual = self.body(torch.cat((features, noise), dim=1))
         radius = self.highpass_kernel // 2
         low_frequency = F.avg_pool2d(
@@ -100,19 +144,34 @@ class SSIU(nn.Module):
         n_blocks: int = 9,
         stochastic: bool = False,
         noise_channels: int = 8,
+        noise_scale: int = 1,
         noise_mode: NoiseMode = "train",
         highpass_kernel: int = 5,
         texture_init_std: float = 1e-5,
         train_texture_only: bool = False,
+        stochastic_feature_blocks: int = 0,
+        feature_noise_init_gain: float = 0.0,
+        train_late_blocks: int = 0,
     ) -> None:
         super().__init__()
         if scale not in (2, 3, 4):
             raise ValueError("scale must be 2, 3, or 4")
         if n_blocks < 3:
             raise ValueError("n_blocks must be at least 3")
+        if not 0 <= stochastic_feature_blocks <= n_blocks:
+            raise ValueError(
+                "stochastic_feature_blocks must be between zero and n_blocks"
+            )
+        if not 0 <= train_late_blocks <= n_blocks:
+            raise ValueError("train_late_blocks must be between zero and n_blocks")
+        if train_texture_only and train_late_blocks:
+            raise ValueError(
+                "train_texture_only and train_late_blocks are mutually exclusive"
+            )
         self.scale = scale
         self.n_blocks = n_blocks
         self.train_texture_only = train_texture_only
+        self.train_late_blocks = train_late_blocks
         self.expert_indices = {
             max(1, round(n_blocks * fraction / 3)) for fraction in (1, 2, 3)
         }
@@ -129,6 +188,17 @@ class SSIU(nn.Module):
                 reduction=2,
             )
             for _ in range(n_blocks)
+        )
+        first_noise_block = n_blocks - stochastic_feature_blocks
+        self.feature_noise = nn.ModuleDict(
+            {
+                str(index): LearnedFeatureNoise(
+                    channels=n_feats,
+                    noise_mode=noise_mode,
+                    init_gain=feature_noise_init_gain,
+                )
+                for index in range(first_noise_block, n_blocks)
+            }
         )
         self.moe = MixtureOfExperts(n_feats)
         if scale == 4:
@@ -158,6 +228,7 @@ class SSIU(nn.Module):
                 out_channels=colors,
                 scale=scale,
                 noise_channels=noise_channels,
+                noise_scale=noise_scale,
                 noise_mode=noise_mode,
                 highpass_kernel=highpass_kernel,
                 init_std=texture_init_std,
@@ -170,9 +241,36 @@ class SSIU(nn.Module):
                 raise ValueError("train_texture_only requires stochastic: true")
             for name, parameter in self.named_parameters():
                 parameter.requires_grad = name.startswith("texture_head.")
+        elif train_late_blocks:
+            first_trainable_block = n_blocks - train_late_blocks
+            trainable_prefixes = (
+                "feature_noise.",
+                "moe.",
+                "tail.",
+                "texture_head.",
+            )
+            for name, parameter in self.named_parameters():
+                trainable_body = any(
+                    name.startswith(f"body.{index}.")
+                    for index in range(first_trainable_block, n_blocks)
+                )
+                parameter.requires_grad = trainable_body or name.startswith(
+                    trainable_prefixes
+                )
 
     def is_parameter_intentionally_frozen(self, name: str) -> bool:
-        return self.train_texture_only and not name.startswith("texture_head.")
+        return (self.train_texture_only or self.train_late_blocks > 0) and not dict(
+            self.named_parameters()
+        )[name].requires_grad
+
+    def feature_noise_gain_statistics(self) -> tuple[Tensor, Tensor] | None:
+        """Return mean and maximum absolute deep-noise gain for diagnostics."""
+        if not self.feature_noise:
+            return None
+        gains = torch.cat(
+            [module.gain.reshape(-1) for module in self.feature_noise.values()]
+        ).abs()
+        return gains.mean(), gains.max()
 
     def forward(self, image: Tensor) -> Tensor:
         height, width = image.shape[-2:]
@@ -182,6 +280,9 @@ class SSIU(nn.Module):
         expert_features: list[Tensor] = []
         for index, block in enumerate(self.body, start=1):
             features = block(features, shallow)
+            noise_key = str(index - 1)
+            if noise_key in self.feature_noise:
+                features = self.feature_noise[noise_key](features)
             if index in self.expert_indices:
                 expert_features.append(features)
         features = self.moe(expert_features) + shallow
@@ -204,11 +305,14 @@ class SSIU(nn.Module):
         incompatible = super().load_state_dict(
             state_dict, strict=strict, assign=assign
         )
-        if self.texture_head is not None and not strict:
+        if not strict:
+            permitted_missing_prefixes = ["feature_noise."]
+            if self.texture_head is not None:
+                permitted_missing_prefixes.append("texture_head.")
             invalid_missing = [
                 key
                 for key in incompatible.missing_keys
-                if not key.startswith("texture_head.")
+                if not key.startswith(tuple(permitted_missing_prefixes))
             ]
             if invalid_missing or incompatible.unexpected_keys:
                 raise RuntimeError(

@@ -283,6 +283,12 @@ class TrainOptions(StrictStruct):
             description="Weight penalizing low-frequency differences between stochastic samples."
         ),
     ] = 0.0
+    stochastic_smooth_region_weight: Annotated[
+        float,
+        Meta(
+            description="Weight penalizing high-frequency differences between stochastic samples in smooth ground-truth regions."
+        ),
+    ] = 0.0
     stochastic_filter_size: Annotated[
         int,
         Meta(

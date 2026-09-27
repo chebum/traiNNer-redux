@@ -55,18 +55,20 @@ def test_detail_weighted_diversity_ignores_flat_targets_and_has_gradients() -> N
     first = torch.zeros(1, 3, 8, 8, requires_grad=True)
     second = torch.randn(1, 3, 8, 8, requires_grad=True) * 0.01
     flat_target = torch.zeros_like(first)
-    _, global_delta, flat_detail_delta = _stochastic_frequency_deltas(
+    _, global_delta, flat_detail_delta, flat_smooth_delta = _stochastic_frequency_deltas(
         first, second, flat_target, 5, 0.01
     )
     assert global_delta > 0
     assert flat_detail_delta == 0
+    assert torch.isclose(flat_smooth_delta, global_delta)
 
     textured_target = torch.zeros_like(first)
     textured_target[:, :, ::2, ::2] = 1
-    _, _, detail_delta = _stochastic_frequency_deltas(
+    _, _, detail_delta, smooth_delta = _stochastic_frequency_deltas(
         first, second, textured_target, 5, 0.01
     )
     assert detail_delta > 0
+    assert smooth_delta >= 0
     detail_delta.backward()
     assert first.grad is not None
     assert torch.count_nonzero(first.grad) > 0

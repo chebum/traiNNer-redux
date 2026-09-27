@@ -2,6 +2,7 @@ import os
 import shutil
 import warnings
 from collections import OrderedDict
+from contextlib import nullcontext
 from os import path as osp
 from typing import Any
 
@@ -41,8 +42,8 @@ def _stochastic_frequency_deltas(
     target: Tensor,
     filter_size: int,
     detail_threshold: float,
-) -> tuple[Tensor, Tensor, Tensor]:
-    """Return low-frequency, global high-frequency, and detail-weighted deltas."""
+) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+    """Return low-, global high-, detail-, and smooth-region deltas."""
     if filter_size < 3 or filter_size % 2 == 0:
         raise ValueError(
             "train.stochastic_filter_size must be an odd integer of at least 3"
@@ -75,7 +76,12 @@ def _stochastic_frequency_deltas(
     detail_high_delta = (high_difference * detail_weight).sum() / (
         detail_weight_sum * high_difference.shape[1]
     )
-    return low_delta, high_delta, detail_high_delta
+    smooth_weight = 1 - detail_weight
+    smooth_weight_sum = smooth_weight.sum().clamp_min(1e-6)
+    smooth_high_delta = (high_difference * smooth_weight).sum() / (
+        smooth_weight_sum * high_difference.shape[1]
+    )
+    return low_delta, high_delta, detail_high_delta, smooth_high_delta
 
 
 class SRModel(BaseModel):
@@ -649,6 +655,18 @@ class SRModel(BaseModel):
                 assert isinstance(self.output, Tensor)
                 l_g_total = torch.tensor(0.0, device=self.output.device)
 
+                gain_statistics = getattr(
+                    self.get_bare_model(self.net_g),
+                    "feature_noise_gain_statistics",
+                    None,
+                )
+                if callable(gain_statistics):
+                    statistics = gain_statistics()
+                    if statistics is not None:
+                        gain_mean, gain_max = statistics
+                        loss_dict["stochastic_gain_mean"] = gain_mean.detach()
+                        loss_dict["stochastic_gain_max"] = gain_max.detach()
+
                 lq_target = None
 
                 # Log entropy if hook captured it
@@ -726,23 +744,43 @@ class SRModel(BaseModel):
 
                 if train_opt.stochastic_second_pass:
                     filter_size = train_opt.stochastic_filter_size
-                    second_output = pixelformat2rgb_pt(
-                        self.net_g(lq), self.gt, self.opt.output_pixel_format
+                    stochastic_objective_enabled = any(
+                        weight > 0
+                        for weight in (
+                            train_opt.stochastic_diversity_weight,
+                            train_opt.stochastic_low_frequency_weight,
+                            train_opt.stochastic_smooth_region_weight,
+                        )
                     )
-                    low_delta, high_delta, detail_high_delta = (
-                        _stochastic_frequency_deltas(
+                    gradient_context = (
+                        nullcontext()
+                        if stochastic_objective_enabled
+                        else torch.no_grad()
+                    )
+                    with gradient_context:
+                        second_output = pixelformat2rgb_pt(
+                            self.net_g(lq), self.gt, self.opt.output_pixel_format
+                        )
+                        (
+                            low_delta,
+                            high_delta,
+                            detail_high_delta,
+                            smooth_high_delta,
+                        ) = _stochastic_frequency_deltas(
                             self.output,
                             second_output,
                             self.gt,
                             filter_size,
                             train_opt.stochastic_detail_threshold,
                         )
-                    )
                     loss_dict["stochastic_hf_delta"] = high_delta.detach()
                     loss_dict["stochastic_detail_hf_delta"] = (
                         detail_high_delta.detach()
                     )
                     loss_dict["stochastic_lf_delta"] = low_delta.detach()
+                    loss_dict["stochastic_smooth_hf_delta"] = (
+                        smooth_high_delta.detach()
+                    )
 
                     if train_opt.stochastic_diversity_weight > 0:
                         diversity_loss = F.relu(
@@ -761,6 +799,16 @@ class SRModel(BaseModel):
                         l_g_total += low_frequency_loss / self.accum_iters
                         loss_dict["l_g_stochastic_low_frequency"] = (
                             low_frequency_loss
+                        )
+
+                    if train_opt.stochastic_smooth_region_weight > 0:
+                        smooth_region_loss = (
+                            smooth_high_delta
+                            * train_opt.stochastic_smooth_region_weight
+                        )
+                        l_g_total += smooth_region_loss / self.accum_iters
+                        loss_dict["l_g_stochastic_smooth_region"] = (
+                            smooth_region_loss
                         )
 
                 if not l_g_total.isfinite():

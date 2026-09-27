@@ -1,6 +1,6 @@
 import pytest
 import torch
-from traiNNer.archs.ssiu_arch import SSIU, StochasticTextureHead
+from traiNNer.archs.ssiu_arch import SSIU, LearnedFeatureNoise, StochasticTextureHead
 
 
 def test_ssiu_x2_shape_and_deterministic_eval() -> None:
@@ -90,6 +90,7 @@ def test_texture_head_disabled_mode_is_shape_safe_for_x3() -> None:
         out_channels=1,
         scale=3,
         noise_channels=2,
+        noise_scale=1,
         noise_mode="disabled",
         highpass_kernel=5,
         init_std=1e-5,
@@ -97,6 +98,40 @@ def test_texture_head_disabled_mode_is_shape_safe_for_x3() -> None:
     output = head(torch.randn(2, 8, 7, 9))
     assert output.shape == (2, 1, 21, 27)
     assert torch.count_nonzero(output) == 0
+
+
+def test_stochastic_texture_head_supports_correlated_noise() -> None:
+    head = StochasticTextureHead(
+        channels=8,
+        out_channels=3,
+        scale=2,
+        noise_channels=2,
+        noise_scale=4,
+        noise_mode="always",
+        highpass_kernel=15,
+        init_std=1e-5,
+    )
+    features = torch.randn(2, 8, 17, 19)
+    torch.manual_seed(1)
+    first = head(features)
+    torch.manual_seed(2)
+    second = head(features)
+    assert first.shape == (2, 3, 34, 38)
+    assert not torch.equal(first, second)
+
+
+def test_stochastic_texture_head_rejects_invalid_noise_scale() -> None:
+    with pytest.raises(ValueError, match="noise_scale"):
+        StochasticTextureHead(
+            channels=8,
+            out_channels=3,
+            scale=2,
+            noise_channels=2,
+            noise_scale=0,
+            noise_mode="always",
+            highpass_kernel=5,
+            init_std=1e-5,
+        )
 
 
 def test_train_texture_only_freezes_deterministic_parameters() -> None:
@@ -119,6 +154,86 @@ def test_train_texture_only_freezes_deterministic_parameters() -> None:
 def test_train_texture_only_requires_stochastic_head() -> None:
     with pytest.raises(ValueError, match="requires stochastic"):
         SSIU(scale=2, n_feats=8, n_blocks=3, train_texture_only=True)
+
+
+def test_zero_gain_deep_noise_preserves_deterministic_checkpoint() -> None:
+    deterministic = SSIU(scale=2, n_feats=8, n_blocks=3)
+    stochastic = SSIU(
+        scale=2,
+        n_feats=8,
+        n_blocks=3,
+        stochastic_feature_blocks=2,
+        noise_mode="always",
+        feature_noise_init_gain=0,
+    )
+    stochastic.load_state_dict(deterministic.state_dict(), strict=False)
+    value = torch.randn(1, 3, 16, 16)
+    assert torch.equal(deterministic(value), stochastic(value))
+
+
+def test_deep_noise_is_seed_dependent_and_gain_receives_gradient() -> None:
+    model = SSIU(
+        scale=2,
+        n_feats=8,
+        n_blocks=3,
+        stochastic_feature_blocks=2,
+        noise_mode="always",
+        feature_noise_init_gain=1e-3,
+    )
+    value = torch.randn(1, 3, 16, 16)
+    torch.manual_seed(1)
+    first = model(value)
+    torch.manual_seed(2)
+    second = model(value)
+    assert not torch.equal(first, second)
+    first.mean().backward()
+    gains = [
+        module.gain.grad
+        for module in model.feature_noise.values()
+        if isinstance(module, LearnedFeatureNoise)
+    ]
+    assert all(gain is not None for gain in gains)
+    assert any(torch.count_nonzero(gain) > 0 for gain in gains if gain is not None)
+
+
+def test_zero_deep_noise_gain_receives_learning_signal() -> None:
+    noise = LearnedFeatureNoise(channels=4, noise_mode="always", init_gain=0)
+    output = noise(torch.randn(1, 4, 8, 8))
+    output.square().mean().backward()
+    assert noise.gain.grad is not None
+    assert torch.count_nonzero(noise.gain.grad) > 0
+
+
+def test_train_late_blocks_freezes_early_structure() -> None:
+    model = SSIU(
+        scale=2,
+        n_feats=8,
+        n_blocks=5,
+        stochastic_feature_blocks=2,
+        train_late_blocks=2,
+    )
+    trainable = {
+        name for name, parameter in model.named_parameters() if parameter.requires_grad
+    }
+    assert "feature_noise.3.gain" in trainable
+    assert any(name.startswith("body.3.") for name in trainable)
+    assert any(name.startswith("body.4.") for name in trainable)
+    assert any(name.startswith("moe.") for name in trainable)
+    assert any(name.startswith("tail.") for name in trainable)
+    assert not any(name.startswith("head.") for name in trainable)
+    assert not any(name.startswith("body.2.") for name in trainable)
+
+
+def test_late_block_training_modes_are_mutually_exclusive() -> None:
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        SSIU(
+            scale=2,
+            n_feats=8,
+            n_blocks=3,
+            stochastic=True,
+            train_texture_only=True,
+            train_late_blocks=1,
+        )
 
 
 def test_nonstandard_block_count_still_selects_three_experts() -> None:
