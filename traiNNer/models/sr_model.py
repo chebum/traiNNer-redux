@@ -656,6 +656,7 @@ class SRModel(BaseModel):
         assert train_opt is not None
 
         skip_d_update = False
+        gan_selected: list[int] | None = None
 
         # optimize net_d
         if self.net_d is not None:
@@ -735,19 +736,28 @@ class SRModel(BaseModel):
                             )
                         selected = select_path_indices(self.gt_paths, path_contains)
                         if not selected:
+                            if label == "l_g_gan":
+                                gan_selected = []
                             continue
                         loss_output = self.output[selected]
                         target = target[selected]
+                        if label == "l_g_gan":
+                            gan_selected = selected
 
                     if label == "l_g_stochastictexture":
                         if alternate_output is None:
                             alternate_output = pixelformat2rgb_pt(
                                 self.net_g(lq), self.gt, self.opt.output_pixel_format
                             )
-                        l_g_loss = loss(loss_output, alternate_output)
+                        alternate_loss_output = (
+                            alternate_output
+                            if selected is None
+                            else alternate_output[selected]
+                        )
+                        l_g_loss = loss(loss_output, alternate_loss_output)
                     elif label == "l_g_gan":
                         assert self.net_d is not None
-                        fake_g_pred = self.net_d(self.output)
+                        fake_g_pred = self.net_d(loss_output)
                         l_g_loss = loss(fake_g_pred, True, is_disc=False)
 
                         if self.adaptive_d:
@@ -925,6 +935,7 @@ class SRModel(BaseModel):
             and cri_gan is not None
             and self.optimizer_d is not None
             and not skip_d_update
+            and gan_selected != []
         ):
             # optimize net_d
             for p in self.net_d.parameters():
@@ -940,14 +951,17 @@ class SRModel(BaseModel):
                 # fidelity losses; D must see the pre-ECO real HR to stay
                 # anchored to the true distribution. self._real_hr is None when
                 # ECO is off, falling back to self.gt (normal behavior).
-                real_d_pred = self.net_d(
-                    self._real_hr if self._real_hr is not None else self.gt
-                )
+                real_hr = self._real_hr if self._real_hr is not None else self.gt
+                fake_hr = self.output.detach()
+                if gan_selected is not None:
+                    real_hr = real_hr[gan_selected]
+                    fake_hr = fake_hr[gan_selected]
+                real_d_pred = self.net_d(real_hr)
                 l_d_real = cri_gan(real_d_pred, True, is_disc=True)
                 loss_dict["l_d_real"] = l_d_real
                 loss_dict["out_d_real"] = torch.mean(real_d_pred.detach())
                 # fake
-                fake_d_pred = self.net_d(self.output.detach())
+                fake_d_pred = self.net_d(fake_hr)
                 l_d_fake = cri_gan(fake_d_pred, False, is_disc=True)
                 loss_dict["l_d_fake"] = l_d_fake
                 loss_dict["out_d_fake"] = torch.mean(fake_d_pred.detach())
