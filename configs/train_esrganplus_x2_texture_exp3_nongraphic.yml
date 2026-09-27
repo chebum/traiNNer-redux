@@ -1,0 +1,90 @@
+# Experiment 3: repeat baseline GAN training using only photos and nature.
+name: 2x_ESRGANplus_texture_exp3_nongraphic
+scale: 2
+use_amp: true
+amp_bf16: true
+use_channels_last: true
+fast_matmul: false
+use_compile: false
+num_gpu: auto
+manual_seed: 1234
+
+datasets:
+  train:
+    name: Photo and nature train
+    type: pairedimagedataset
+    dataroot_gt:
+      - datasets/mined_hr_512_photo/train/photo
+      - datasets/mined_hr_512_nature/train/nature
+    dataroot_lq:
+      - datasets/mined_lq_x2_photo/train/photo
+      - datasets/mined_lq_x2_nature/train/nature
+    lq_size: 128
+    use_hflip: true
+    use_rot: true
+    num_worker_per_gpu: 8
+    batch_size_per_gpu: 8
+    accum_iter: 1
+
+network_g:
+  type: esrganplus
+  num_filters: 64
+  num_blocks: 23
+  growth_channels: 32
+  noise_sigma: 0.1
+  noise_mode: always
+
+network_d:
+  type: unetdiscriminatorsn
+  num_feat: 64
+  skip_connection: true
+
+path:
+  pretrain_network_g: experiments/2x_ESRGANplus_clean_fidelity_v2/models/net_g_ema_35000.safetensors
+  pretrain_network_g_ema: experiments/2x_ESRGANplus_clean_fidelity_v2/models/net_g_ema_35000.safetensors
+  param_key_g: ~
+  strict_load_g: true
+  resume_state: ~
+
+train:
+  ema_decay: 0.999
+  ema_power: 0.75
+  grad_clip: true
+  grad_clip_max_norm: 10
+  optim_g:
+    type: AdamW
+    lr: !!float 1e-4
+    weight_decay: 0
+    betas: [0.9, 0.99]
+  optim_d:
+    type: AdamW
+    lr: !!float 1e-4
+    weight_decay: 0
+    betas: [0.9, 0.99]
+  scheduler:
+    type: MultiStepLR
+    milestones: [1800, 2250]
+    gamma: 0.5
+  total_iter: 2500
+  warmup_iter: 500
+  losses:
+    - type: perceptualloss
+      criterion: charbonnier
+      loss_weight: 0.01
+    - type: ganloss
+      gan_type: vanilla
+      loss_weight: 0.05
+
+val:
+  val_enabled: false
+  val_freq: 2500
+  save_img: false
+  stochastic_samples: 4
+  stochastic_seed: 0
+  metrics_enabled: false
+
+logger:
+  print_freq: 100
+  save_checkpoint_freq: 2500
+  save_checkpoint_format: safetensors
+  use_tb_logger: true

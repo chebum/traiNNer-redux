@@ -409,13 +409,6 @@ class ValOptions(StrictStruct):
     stochastic_seed: Annotated[
         int, Meta(description="Base seed used for stochastic validation samples.")
     ] = 0
-    stochastic_selection: Annotated[
-        Literal["first", "best", "worst"],
-        Meta(
-            description="Which sample is used for metrics and the primary saved validation image."
-        ),
-    ] = "first"
-
     metrics_enabled: Annotated[
         bool, Meta(description="Whether to run metrics calculations during validation.")
     ] = False

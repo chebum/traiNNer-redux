@@ -9,9 +9,9 @@ from torch.utils.data.dataloader import _collate_fn_t, _worker_init_fn_t
 
 class DataFeed(TypedDict):
     lq: NotRequired[Tensor]
-    lq_path: NotRequired[str]
+    lq_path: NotRequired[str | list[str]]
     gt: NotRequired[Tensor]
-    gt_path: NotRequired[str]
+    gt_path: NotRequired[str | list[str]]
     kernel1: NotRequired[Tensor]
     kernel2: NotRequired[Tensor]
     sinc_kernel: NotRequired[Tensor]

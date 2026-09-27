@@ -1,5 +1,5 @@
-# Clean x2 nESRGAN+ fidelity pretraining. No blur, noise, JPEG, or OTF degradation.
-name: 2x_ESRGANplus_clean_fidelity_v2
+# Experiment 2: baseline GAN setup plus explicit high-frequency seed diversity.
+name: 2x_ESRGANplus_texture_exp2
 scale: 2
 use_amp: true
 amp_bf16: true
@@ -49,11 +49,16 @@ network_g:
   num_blocks: 23
   growth_channels: 32
   noise_sigma: 0.1
-  # Pixel-only fidelity pretraining should not penalize seed-dependent alternatives.
-  # Enable noise in the later perceptual/GAN phase.
-  noise_mode: disabled
+  noise_mode: always
+
+network_d:
+  type: unetdiscriminatorsn
+  num_feat: 64
+  skip_connection: true
 
 path:
+  pretrain_network_g: experiments/2x_ESRGANplus_clean_fidelity_v2/models/net_g_ema_35000.safetensors
+  pretrain_network_g_ema: experiments/2x_ESRGANplus_clean_fidelity_v2/models/net_g_ema_35000.safetensors
   param_key_g: ~
   strict_load_g: true
   resume_state: ~
@@ -61,42 +66,47 @@ path:
 train:
   ema_decay: 0.999
   ema_power: 0.75
-  grad_clip: false
+  grad_clip: true
+  grad_clip_max_norm: 10
   optim_g:
     type: AdamW
-    lr: !!float 2e-4
+    lr: !!float 1e-4
+    weight_decay: 0
+    betas: [0.9, 0.99]
+  optim_d:
+    type: AdamW
+    lr: !!float 1e-4
     weight_decay: 0
     betas: [0.9, 0.99]
   scheduler:
     type: MultiStepLR
-    milestones: [100000, 175000, 225000]
+    milestones: [1800, 2250]
     gamma: 0.5
-  total_iter: 250000
-  warmup_iter: 2000
+  total_iter: 2500
+  warmup_iter: 500
   losses:
     - type: charbonnierloss
-      loss_weight: 1.0
+      loss_weight: 0.1
+      path_contains: ["/text/"]
+    - type: perceptualloss
+      criterion: charbonnier
+      loss_weight: 0.01
+    - type: ganloss
+      gan_type: vanilla
+      loss_weight: 0.05
+    - type: stochastictextureloss
+      loss_weight: 0.5
+      diversity_margin: 0.015
+      low_frequency_weight: 1.0
+      kernel_size: 5
 
 val:
-  val_enabled: true
+  val_enabled: false
   val_freq: 2500
-  save_img: true
-  tile_size: 0
-  tile_overlap: 0
-  # Fixed seed 0 is the deployable primary benchmark. Multi-seed diagnostics
-  # belong to the later stochastic perceptual/GAN phase.
-  stochastic_samples: 1
+  save_img: false
+  stochastic_samples: 4
   stochastic_seed: 0
-  metrics_enabled: true
-  metrics:
-    psnr:
-      type: calculate_psnr
-      crop_border: 2
-      test_y_channel: false
-    ssim:
-      type: calculate_ssim
-      crop_border: 2
-      test_y_channel: false
+  metrics_enabled: false
 
 logger:
   print_freq: 100

@@ -24,6 +24,10 @@ from traiNNer.data.base_dataset import BaseDataset
 from traiNNer.data.degradations import resize_pt
 from traiNNer.losses import build_loss
 from traiNNer.metrics import calculate_metric
+from traiNNer.metrics.stochastic import (
+    stochastic_output_diagnostics,
+    summarize_seed_metrics,
+)
 from traiNNer.models.base_model import BaseModel
 from traiNNer.utils import get_root_logger, imwrite, tensor2img
 from traiNNer.utils.color_util import pixelformat2rgb_pt, rgb2pixelformat_pt
@@ -32,6 +36,15 @@ from traiNNer.utils.logger import clickable_file_path
 from traiNNer.utils.misc import loss_type_to_label
 from traiNNer.utils.redux_options import ReduxOptions
 from traiNNer.utils.types import DataFeed
+
+
+def select_path_indices(paths: list[str], markers: tuple[str, ...]) -> list[int]:
+    """Return batch indices whose paths contain at least one configured marker."""
+    return [
+        index
+        for index, path in enumerate(paths)
+        if any(marker in path for marker in markers)
+    ]
 
 
 class SRModel(BaseModel):
@@ -210,6 +223,8 @@ class SRModel(BaseModel):
                     self.net_d = self.model_to_device(self.net_d)
 
             self.losses = {}
+            self.loss_path_contains: dict[str, tuple[str, ...]] = {}
+            self.gt_paths: list[str] = []
 
             self.ema_decay = 0
             self.net_g_ema: EMA | None = None
@@ -324,9 +339,19 @@ class SRModel(BaseModel):
             assert "loss_weight" in loss, f"{loss['type']} must define loss_weight"
             if float(loss["loss_weight"]) != 0:
                 label = loss_type_to_label(loss["type"])
+                loss_config = loss.copy()
+                path_contains = loss_config.pop("path_contains", None)
+                if path_contains is not None:
+                    if not isinstance(path_contains, list) or not all(
+                        isinstance(value, str) and value for value in path_contains
+                    ):
+                        raise ValueError(
+                            f"{loss['type']}.path_contains must be a list of strings"
+                        )
+                    self.loss_path_contains[label] = tuple(path_contains)
                 if label == "l_g_gan":
                     self.has_gan = True
-                self.losses[label] = build_loss(loss).to(
+                self.losses[label] = build_loss(loss_config).to(
                     self.device,
                     memory_format=self.memory_format,
                     non_blocking=True,
@@ -460,6 +485,8 @@ class SRModel(BaseModel):
             )
 
     def feed_data(self, data: DataFeed) -> None:
+        gt_paths = data.get("gt_path", [])
+        self.gt_paths = [gt_paths] if isinstance(gt_paths, str) else list(gt_paths)
         if "lq" not in data:
             # GT-only dataset with per-batch GPU-side LQ synthesis.
             assert "gt" in data and "lq_resize_mode" in data, (
@@ -582,6 +609,7 @@ class SRModel(BaseModel):
                 l_g_total = torch.tensor(0.0, device=self.output.device)
 
                 lq_target = None
+                alternate_output = None
 
                 # Log entropy if hook captured it
                 if (
@@ -594,6 +622,8 @@ class SRModel(BaseModel):
 
                 for label, loss in self.losses.items():
                     target = self.gt
+                    loss_output = self.output
+                    selected: list[int] | None = None
 
                     if loss.loss_weight < 0:
                         if lq_target is None:
@@ -610,7 +640,26 @@ class SRModel(BaseModel):
                                 )
                         target = lq_target
 
-                    if label == "l_g_gan":
+                    path_contains = self.loss_path_contains.get(label)
+                    if path_contains is not None:
+                        if len(self.gt_paths) != n_samples:
+                            raise ValueError(
+                                f"Loss {label} uses path_contains, but the batch has "
+                                f"{n_samples} samples and {len(self.gt_paths)} GT paths"
+                            )
+                        selected = select_path_indices(self.gt_paths, path_contains)
+                        if not selected:
+                            continue
+                        loss_output = self.output[selected]
+                        target = target[selected]
+
+                    if label == "l_g_stochastictexture":
+                        if alternate_output is None:
+                            alternate_output = pixelformat2rgb_pt(
+                                self.net_g(lq), self.gt, self.opt.output_pixel_format
+                            )
+                        l_g_loss = loss(loss_output, alternate_output)
+                    elif label == "l_g_gan":
                         assert self.net_d is not None
                         fake_g_pred = self.net_d(self.output)
                         l_g_loss = loss(fake_g_pred, True, is_disc=False)
@@ -641,9 +690,12 @@ class SRModel(BaseModel):
                                 self.gt,
                                 self.opt.output_pixel_format,
                             )
-                        l_g_loss = loss(self.output, output_ema, target)
+                        loss_output_ema = (
+                            output_ema if selected is None else output_ema[selected]
+                        )
+                        l_g_loss = loss(loss_output, loss_output_ema, target)
                     else:
-                        l_g_loss = loss(self.output, target)
+                        l_g_loss = loss(loss_output, target)
 
                     if isinstance(l_g_loss, dict):
                         for sublabel, loss_val in l_g_loss.items():
@@ -896,19 +948,9 @@ class SRModel(BaseModel):
                         )
                     )
 
-            selection = self.opt.val.stochastic_selection
-            selected_index = 0
-            if selection != "first" and self.gt is not None:
-                errors = [
-                    torch.mean(torch.abs(output - self.gt)).item()
-                    for output in self.validation_outputs
-                ]
-                selected_index = (
-                    errors.index(max(errors))
-                    if selection == "worst"
-                    else errors.index(min(errors))
-                )
-            self.output = self.validation_outputs[selected_index]
+            # The fixed first seed is the deployable primary result. Other
+            # samples are diagnostics only and must never act as a GT oracle.
+            self.output = self.validation_outputs[0]
 
             if self.net_g_ema is None and self.is_train:
                 net.train()
@@ -959,6 +1001,8 @@ class SRModel(BaseModel):
             self.metric_results = dict.fromkeys(self.metric_results, 0)
 
         metric_data = {}
+        stochastic_metric_results: dict[str, dict[str, float]] = {}
+        stochastic_output_results: dict[str, float] = {}
         pbar = None
         if self.use_pbar:
             pbar = tqdm(total=len(dataloader), unit="image")
@@ -980,6 +1024,16 @@ class SRModel(BaseModel):
             img_name = osp.splitext(osp.basename(val_data["lq_path"][0]))[0]
             self.feed_data(val_data)
             self.test()
+
+            if len(self.validation_outputs) > 1:
+                assert self.lq is not None
+                diagnostics = stochastic_output_diagnostics(
+                    self.validation_outputs, self.lq
+                )
+                for name, value in diagnostics.items():
+                    stochastic_output_results[name] = (
+                        stochastic_output_results.get(name, 0.0) + value
+                    )
 
             visuals = self.get_current_visuals()
             sr_img = tensor2img(
@@ -1084,6 +1138,24 @@ class SRModel(BaseModel):
                     result = calculate_metric(metric_data, opt_, self.device)
                     # logger.info("%d %s/%s: %f", current_iter, name, img_name, result)
                     self.metric_results[name] += result
+                    if len(self.validation_outputs) > 1:
+                        seeded_values = []
+                        for sample_output in self.validation_outputs:
+                            sample_metric_data = {
+                                "img": tensor2img(sample_output, to_bgr=False),
+                                gt_key: metric_data[gt_key],
+                            }
+                            seeded_values.append(
+                                calculate_metric(sample_metric_data, opt_, self.device)
+                            )
+                        summary = summarize_seed_metrics(
+                            seeded_values, opt_.get("better", "higher")
+                        )
+                        accumulator = stochastic_metric_results.setdefault(
+                            name, dict.fromkeys(summary, 0.0)
+                        )
+                        for key, value in summary.items():
+                            accumulator[key] += value
             if pbar is not None:
                 pbar.update(1)
                 pbar.set_description(f"Test {img_name}")
@@ -1099,6 +1171,38 @@ class SRModel(BaseModel):
                 )
 
             self._log_validation_metric_values(current_iter, dataset_name, tb_logger)
+
+        if stochastic_output_results:
+            count = len(dataloader)
+            stochastic_output_results = {
+                name: value / count for name, value in stochastic_output_results.items()
+            }
+            for summary in stochastic_metric_results.values():
+                for key in summary:
+                    summary[key] /= count
+            diagnostic_lines = ["Stochastic validation diagnostics (non-oracle)"]
+            diagnostic_lines.extend(
+                f"\t # {name}: {value:.6f}"
+                for name, value in stochastic_output_results.items()
+            )
+            for metric, summary in stochastic_metric_results.items():
+                diagnostic_lines.append(
+                    f"\t # {metric}: mean={summary['mean']:.4f}, "
+                    f"std={summary['std']:.4f}, worst={summary['worst']:.4f}"
+                )
+            logger.info("\n".join(diagnostic_lines))
+            if tb_logger:
+                for name, value in stochastic_output_results.items():
+                    tb_logger.add_scalar(
+                        f"stochastic/{dataset_name}/{name}", value, current_iter
+                    )
+                for metric, summary in stochastic_metric_results.items():
+                    for statistic, value in summary.items():
+                        tb_logger.add_scalar(
+                            f"stochastic/{dataset_name}/{metric}_{statistic}",
+                            value,
+                            current_iter,
+                        )
 
         self.first_val_completed = True
         self.is_train = True

@@ -10,7 +10,7 @@ class RandomGenerator(nn.Module):
         return value + torch.randn_like(value) * 0.1
 
 
-def test_validation_generates_four_seeds_and_selects_worst() -> None:
+def test_validation_generates_four_seeds_and_uses_fixed_first_seed() -> None:
     model = object.__new__(SRModel)
     model.device = torch.device("cpu")
     model.amp_dtype = torch.float32
@@ -27,7 +27,6 @@ def test_validation_generates_four_seeds_and_selects_worst() -> None:
         val=SimpleNamespace(
             stochastic_samples=4,
             stochastic_seed=10,
-            stochastic_selection="worst",
             tile_size=0,
         ),
     )
@@ -42,10 +41,6 @@ def test_validation_generates_four_seeds_and_selects_worst() -> None:
         not torch.equal(model.validation_outputs[0], output)
         for output in model.validation_outputs[1:]
     )
-    errors = [
-        torch.mean(torch.abs(output - model.gt)).item()
-        for output in model.validation_outputs
-    ]
-    assert torch.equal(model.output, model.validation_outputs[errors.index(max(errors))])
+    assert torch.equal(model.output, model.validation_outputs[0])
     # Validation must not disturb the training RNG stream.
     assert torch.equal(torch.rand(1), expected_next_random)
