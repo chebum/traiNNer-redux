@@ -341,9 +341,9 @@ class LPIPS(nn.Module):
                 for kk in range(self.L)
             ]
 
-        val = torch.zeros((1, 1, 1, 1), device=res[0].device)
-        for l in range(self.L):
-            val += res[l]
+        val = res[0]
+        for layer_result in res[1:]:
+            val = val + layer_result
 
         if ret_per_layer:
             return (val, res)

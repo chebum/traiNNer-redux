@@ -1,0 +1,134 @@
+# Texture-only stochastic SSIU restart from the sharp deterministic checkpoint.
+name: 2x_SSIU_clean_stochastic_lpips_failfast
+scale: 2
+use_amp: false
+amp_bf16: false
+use_channels_last: false
+fast_matmul: false
+use_compile: false
+num_gpu: auto
+device: mps
+manual_seed: 1234
+
+datasets:
+  train:
+    name: Clean mined train
+    type: pairedimagedataset
+    dataroot_gt:
+      - datasets/mined_hr_512_text/train/text
+      - datasets/mined_hr_512_photo/train/photo
+      - datasets/mined_hr_512_nature/train/nature
+      - datasets/mined_hr_512_anime/train/anime
+    dataroot_lq:
+      - datasets/mined_lq_x2_text/train/text
+      - datasets/mined_lq_x2_photo/train/photo
+      - datasets/mined_lq_x2_nature/train/nature
+      - datasets/mined_lq_x2_anime/train/anime
+    lq_size: 128
+    use_hflip: true
+    use_rot: true
+    num_worker_per_gpu: 8
+    batch_size_per_gpu: 8
+    accum_iter: 1
+  val_text:
+    name: Clean text fail-fast val
+    type: pairedimagedataset
+    dataroot_gt: [datasets/mined_hr_512_text/val/text]
+    dataroot_lq: [datasets/mined_lq_x2_text/val/text]
+    max_dataset_size: 16
+  val_photo:
+    name: Clean photo fail-fast val
+    type: pairedimagedataset
+    dataroot_gt: [datasets/mined_hr_512_photo/val/photo]
+    dataroot_lq: [datasets/mined_lq_x2_photo/val/photo]
+    max_dataset_size: 16
+  val_nature:
+    name: Clean nature fail-fast val
+    type: pairedimagedataset
+    dataroot_gt: [datasets/mined_hr_512_nature/val/nature]
+    dataroot_lq: [datasets/mined_lq_x2_nature/val/nature]
+    max_dataset_size: 16
+  val_anime:
+    name: Clean anime fail-fast val
+    type: pairedimagedataset
+    dataroot_gt: [datasets/mined_hr_512_anime/val/anime]
+    dataroot_lq: [datasets/mined_lq_x2_anime/val/anime]
+    max_dataset_size: 16
+
+network_g:
+  type: SSIU
+  colors: 3
+  n_feats: 64
+  n_blocks: 9
+  stochastic: true
+  noise_channels: 8
+  noise_mode: always
+  highpass_kernel: 5
+  texture_init_std: !!float 1e-5
+  # Preserve the sharp checkpoint exactly; optimize only texture_head.*.
+  train_texture_only: true
+
+path:
+  pretrain_network_g: /Users/ivannikitin/PycharmProjects/AI_watermark_worker/models/SSIU/SSIU-x2-clean70-jpeg30-perceptual.safetensors
+  param_key_g: ~
+  strict_load_g: false
+  resume_state: ~
+
+train:
+  ema_decay: 0.999
+  ema_power: 0.75
+  grad_clip: true
+  grad_clip_max_norm: 1.0
+  stochastic_second_pass: true
+  stochastic_diversity_target: 0.0019607843  # 0.5/255
+  stochastic_detail_threshold: 0.01
+  stochastic_diversity_weight: 1.0
+  stochastic_low_frequency_weight: 0.1
+  stochastic_filter_size: 5
+  optim_g:
+    type: AdamW
+    lr: !!float 5e-5
+    weight_decay: 0
+    betas: [0.9, 0.99]
+  scheduler:
+    type: MultiStepLR
+    milestones: [2000]
+    gamma: 0.5
+  total_iter: 3000
+  warmup_iter: 100
+  losses:
+    # Actual learned LPIPS; no full-resolution pixel or complex FFT matching.
+    - type: lpipsloss
+      net: vgg
+      loss_weight: 1.0
+    # Preserve color/geometry only after an 8x low-pass/downsample operation.
+    - type: averageloss
+      criterion: l1
+      scale: 8
+      loss_weight: 1.0
+
+val:
+  val_enabled: true
+  val_freq: 250
+  save_img: true
+  tile_size: 0
+  tile_overlap: 0
+  stochastic_samples: 4
+  stochastic_seed: 0
+  stochastic_selection: first
+  metrics_enabled: true
+  metrics:
+    psnr:
+      type: calculate_psnr
+      crop_border: 2
+      test_y_channel: false
+    ssim:
+      type: calculate_ssim
+      crop_border: 2
+      test_y_channel: false
+
+logger:
+  print_freq: 50
+  save_checkpoint_freq: 250
+  save_checkpoint_format: safetensors
+  use_tb_logger: true

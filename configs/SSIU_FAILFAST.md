@@ -68,3 +68,20 @@ sharper deployment safetensors checkpoint instead.
 The perceptual loss initializes torchvision VGG19 weights. Ensure those weights
 are cached or that the first launch has network access before starting both
 runs.
+
+## Texture-only LPIPS restart
+
+`train_ssiu_x2_clean_stochastic_lpips_failfast.yml` is a fresh experiment from
+the original sharp deterministic checkpoint, not from the 15,000-step
+stochastic model. It freezes every deterministic SSIU parameter and trains only
+`texture_head.*`. Complex FFT and full-resolution pixel losses are removed;
+learned LPIPS supervises perceptual plausibility, while an 8x average loss and
+the existing low-frequency seed penalty protect color and geometry.
+
+The run lasts 3,000 iterations and validates every 250. Stop early if seed
+differences remain below one 8-bit level by iteration 1,000, or if the amplified
+difference maps show spatially uniform grain instead of content-aligned detail.
+
+```bash
+caffeinate -i uv run python train.py -opt configs/train_ssiu_x2_clean_stochastic_lpips_failfast.yml
+```

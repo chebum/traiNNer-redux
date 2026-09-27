@@ -103,6 +103,7 @@ class SSIU(nn.Module):
         noise_mode: NoiseMode = "train",
         highpass_kernel: int = 5,
         texture_init_std: float = 1e-5,
+        train_texture_only: bool = False,
     ) -> None:
         super().__init__()
         if scale not in (2, 3, 4):
@@ -111,6 +112,7 @@ class SSIU(nn.Module):
             raise ValueError("n_blocks must be at least 3")
         self.scale = scale
         self.n_blocks = n_blocks
+        self.train_texture_only = train_texture_only
         self.expert_indices = {
             max(1, round(n_blocks * fraction / 3)) for fraction in (1, 2, 3)
         }
@@ -163,6 +165,14 @@ class SSIU(nn.Module):
             if stochastic
             else None
         )
+        if train_texture_only:
+            if self.texture_head is None:
+                raise ValueError("train_texture_only requires stochastic: true")
+            for name, parameter in self.named_parameters():
+                parameter.requires_grad = name.startswith("texture_head.")
+
+    def is_parameter_intentionally_frozen(self, name: str) -> bool:
+        return self.train_texture_only and not name.startswith("texture_head.")
 
     def forward(self, image: Tensor) -> Tensor:
         height, width = image.shape[-2:]

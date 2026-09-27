@@ -481,6 +481,10 @@ class SRModel(BaseModel):
         # assert train_opt.optim_g is not None
         optim_params = []
         logger = get_root_logger()
+        intentional_frozen_count = 0
+        intentional_freeze_check = getattr(
+            self.net_g, "is_parameter_intentionally_frozen", None
+        )
 
         if train_opt.optim_g is not None:
             for k, v in self.net_g.named_parameters():
@@ -488,8 +492,17 @@ class SRModel(BaseModel):
                     optim_params.append(v)
                 elif "eval_" in k:
                     pass  # intentionally frozen for reparameterization, skip warning
+                elif callable(intentional_freeze_check) and intentional_freeze_check(k):
+                    intentional_frozen_count += 1
                 else:
                     logger.warning("Params %s will not be optimized.", k)
+
+            if intentional_frozen_count:
+                logger.info(
+                    "Intentionally froze %d generator parameters; optimizing %d trainable tensors.",
+                    intentional_frozen_count,
+                    len(optim_params),
+                )
 
             self.optimizer_g = self.get_optimizer(optim_params, train_opt.optim_g)
             self.optimizers.append(self.optimizer_g)

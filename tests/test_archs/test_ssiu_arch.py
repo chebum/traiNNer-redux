@@ -99,6 +99,28 @@ def test_texture_head_disabled_mode_is_shape_safe_for_x3() -> None:
     assert torch.count_nonzero(output) == 0
 
 
+def test_train_texture_only_freezes_deterministic_parameters() -> None:
+    model = SSIU(
+        scale=2,
+        n_feats=8,
+        n_blocks=3,
+        stochastic=True,
+        noise_channels=2,
+        train_texture_only=True,
+    )
+    trainable = {
+        name for name, parameter in model.named_parameters() if parameter.requires_grad
+    }
+    assert trainable
+    assert all(name.startswith("texture_head.") for name in trainable)
+    assert not model.head.weight.requires_grad
+
+
+def test_train_texture_only_requires_stochastic_head() -> None:
+    with pytest.raises(ValueError, match="requires stochastic"):
+        SSIU(scale=2, n_feats=8, n_blocks=3, train_texture_only=True)
+
+
 def test_nonstandard_block_count_still_selects_three_experts() -> None:
     model = SSIU(scale=2, n_feats=8, n_blocks=5)
     assert len(model.expert_indices) == 3
