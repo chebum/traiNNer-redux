@@ -1,5 +1,7 @@
-# Experiment 2: baseline GAN setup plus explicit high-frequency seed diversity.
-name: 2x_ESRGANplus_texture_exp2
+# Experiment 5: corrected deep learned noise with a distributional GAN signal.
+# This deliberately omits an explicit diversity floor; useful stochasticity
+# must emerge from the adversarial objective rather than arbitrary difference.
+name: 2x_ESRGANplus_texture_exp5_learned_gan
 scale: 2
 use_amp: true
 amp_bf16: true
@@ -11,46 +13,33 @@ manual_seed: 1234
 
 datasets:
   train:
-    name: Clean mined train
+    name: Clean photo and nature train
     type: pairedimagedataset
     dataroot_gt:
-      - datasets/mined_hr_512_text/train/text
       - datasets/mined_hr_512_photo/train/photo
       - datasets/mined_hr_512_nature/train/nature
-      - datasets/mined_hr_512_anime/train/anime
     dataroot_lq:
-      - datasets/mined_lq_x2_text/train/text
       - datasets/mined_lq_x2_photo/train/photo
       - datasets/mined_lq_x2_nature/train/nature
-      - datasets/mined_lq_x2_anime/train/anime
     lq_size: 128
     use_hflip: true
     use_rot: true
     num_worker_per_gpu: 8
     batch_size_per_gpu: 8
     accum_iter: 1
-  val:
-    name: Clean mined val
-    type: pairedimagedataset
-    dataroot_gt:
-      - datasets/mined_hr_512_text/val/text
-      - datasets/mined_hr_512_photo/val/photo
-      - datasets/mined_hr_512_nature/val/nature
-      - datasets/mined_hr_512_anime/val/anime
-    dataroot_lq:
-      - datasets/mined_lq_x2_text/val/text
-      - datasets/mined_lq_x2_photo/val/photo
-      - datasets/mined_lq_x2_nature/val/nature
-      - datasets/mined_lq_x2_anime/val/anime
 
 network_g:
   type: esrganplus
   num_filters: 64
   num_blocks: 23
   growth_channels: 32
-  noise_sigma: 0.1
+  # Follow the paper's claimed learned per-feature scaling. Noise is injected
+  # after the 69 residual dense blocks only, matching its diagram and public
+  # block placement rather than experiments 1-4's extra 23 RRDB injections.
   noise_mode: always
-  noise_after_rrdb: true
+  noise_style: learned_additive
+  noise_init_gain: 0.001
+  noise_after_rrdb: false
 
 network_d:
   type: unetdiscriminatorsn
@@ -61,17 +50,26 @@ path:
   pretrain_network_g: experiments/2x_ESRGANplus_clean_fidelity_v2/models/net_g_ema_35000.safetensors
   pretrain_network_g_ema: experiments/2x_ESRGANplus_clean_fidelity_v2/models/net_g_ema_35000.safetensors
   param_key_g: ~
-  strict_load_g: true
+  # The fidelity checkpoint lacks only the newly introduced gain parameters.
+  strict_load_g: false
   resume_state: ~
 
 train:
   ema_decay: 0.999
   ema_power: 0.75
   grad_clip: true
-  grad_clip_max_norm: 10
+  grad_clip_max_norm: 1.0
+  # A diagnostic second sample tracks whether GAN training uses the gains.
+  # It contributes no diversity, low-frequency, or smooth-region objective.
+  stochastic_second_pass: true
+  stochastic_diversity_weight: 0.0
+  stochastic_low_frequency_weight: 0.0
+  stochastic_smooth_region_weight: 0.0
+  stochastic_detail_threshold: 0.01
+  stochastic_filter_size: 15
   optim_g:
     type: AdamW
-    lr: !!float 1e-4
+    lr: !!float 2e-5
     weight_decay: 0
     betas: [0.9, 0.99]
   optim_d:
@@ -81,25 +79,21 @@ train:
     betas: [0.9, 0.99]
   scheduler:
     type: MultiStepLR
-    milestones: [1800, 2250]
+    milestones: [1500, 2200]
     gamma: 0.5
   total_iter: 2500
-  warmup_iter: 500
+  warmup_iter: 100
   losses:
-    - type: charbonnierloss
-      loss_weight: 0.1
-      path_contains: ["/text/"]
-    - type: perceptualloss
-      criterion: charbonnier
-      loss_weight: 0.01
+    - type: lpipsloss
+      net: vgg
+      loss_weight: 1.0
+    - type: averageloss
+      criterion: l1
+      scale: 8
+      loss_weight: 0.02
     - type: ganloss
-      gan_type: vanilla
-      loss_weight: 0.05
-    - type: stochastictextureloss
-      loss_weight: 0.5
-      diversity_margin: 0.015
-      low_frequency_weight: 1.0
-      kernel_size: 5
+      gan_type: hinge
+      loss_weight: 0.005
 
 val:
   val_enabled: false
@@ -110,7 +104,7 @@ val:
   metrics_enabled: false
 
 logger:
-  print_freq: 100
-  save_checkpoint_freq: 2500
+  print_freq: 50
+  save_checkpoint_freq: 250
   save_checkpoint_format: safetensors
   use_tb_logger: true

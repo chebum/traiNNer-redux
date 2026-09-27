@@ -37,4 +37,5 @@ test -f experiments/2x_ESRGANplus_texture_exp4_nongraphic_diversity/models/net_g
     --checkpoint experiments/2x_ESRGANplus_texture_exp4_nongraphic_diversity/models/net_g_ema_2500.safetensors \
     --output experiments/stochastic_eval/texture_exp4_nongraphic_diversity_2500 \
     --samples-per-category 2 \
-    --seeds 4
+    --seeds 4 \
+    --noise-after-rrdb

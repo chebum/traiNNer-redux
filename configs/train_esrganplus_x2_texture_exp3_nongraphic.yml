@@ -33,6 +33,7 @@ network_g:
   growth_channels: 32
   noise_sigma: 0.1
   noise_mode: always
+  noise_after_rrdb: true
 
 network_d:
   type: unetdiscriminatorsn

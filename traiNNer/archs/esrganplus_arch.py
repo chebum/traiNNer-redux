@@ -13,6 +13,7 @@ from torch import Tensor, nn
 from traiNNer.utils.registry import ARCH_REGISTRY
 
 NoiseMode = Literal["train", "always", "disabled"]
+NoiseStyle = Literal["multiplicative", "learned_additive"]
 
 
 class GaussianNoise(nn.Module):
@@ -28,19 +29,39 @@ class GaussianNoise(nn.Module):
         sigma: float = 0.1,
         noise_mode: NoiseMode = "train",
         relative_detach: bool = False,
+        *,
+        channels: int | None = None,
+        noise_style: NoiseStyle = "multiplicative",
+        init_gain: float = 0.001,
     ) -> None:
         super().__init__()
         if noise_mode not in ("train", "always", "disabled"):
             raise ValueError(f"Unsupported noise_mode: {noise_mode}")
+        if noise_style not in ("multiplicative", "learned_additive"):
+            raise ValueError(f"Unsupported noise_style: {noise_style}")
+        if noise_style == "learned_additive" and channels is None:
+            raise ValueError("channels are required for learned additive noise")
+        if init_gain < 0:
+            raise ValueError("noise_init_gain must be non-negative")
         self.sigma = sigma
         self.noise_mode = noise_mode
         self.relative_detach = relative_detach
+        self.noise_style = noise_style
+        self.gain = (
+            nn.Parameter(torch.full((1, channels, 1, 1), float(init_gain)))
+            if noise_style == "learned_additive" and channels is not None
+            else None
+        )
 
     def forward(self, x: Tensor) -> Tensor:
         enabled = self.noise_mode == "always" or (
             self.noise_mode == "train" and self.training
         )
-        if not enabled or self.sigma == 0:
+        if not enabled:
+            return x
+        if self.gain is not None:
+            return x + torch.randn_like(x) * self.gain
+        if self.sigma == 0:
             return x
         scale = self.sigma * (x.detach() if self.relative_detach else x)
         return x + torch.randn_like(x) * scale
@@ -67,9 +88,17 @@ class ResidualDenseBlock5C(nn.Module):
         num_grow_ch: int,
         noise_sigma: float,
         noise_mode: NoiseMode,
+        noise_style: NoiseStyle,
+        noise_init_gain: float,
     ) -> None:
         super().__init__()
-        self.noise = GaussianNoise(noise_sigma, noise_mode)
+        self.noise = GaussianNoise(
+            noise_sigma,
+            noise_mode,
+            channels=num_feat,
+            noise_style=noise_style,
+            init_gain=noise_init_gain,
+        )
         # Bias=False is required for compatibility with the reference model.
         self.conv1x1 = nn.Conv2d(num_feat, num_grow_ch, 1, bias=False)
         self.conv1 = _conv(num_feat, num_grow_ch)
@@ -94,14 +123,34 @@ class RRDBPlus(nn.Module):
         num_grow_ch: int,
         noise_sigma: float,
         noise_mode: NoiseMode,
+        noise_style: NoiseStyle,
+        noise_init_gain: float,
+        noise_after_rrdb: bool,
     ) -> None:
         super().__init__()
-        args = (num_feat, num_grow_ch, noise_sigma, noise_mode)
+        args = (
+            num_feat,
+            num_grow_ch,
+            noise_sigma,
+            noise_mode,
+            noise_style,
+            noise_init_gain,
+        )
         # Attribute names preserve ESRGAN+ checkpoint compatibility.
         self.RDB1 = ResidualDenseBlock5C(*args)
         self.RDB2 = ResidualDenseBlock5C(*args)
         self.RDB3 = ResidualDenseBlock5C(*args)
-        self.noise = GaussianNoise(noise_sigma, noise_mode)
+        self.noise = (
+            GaussianNoise(
+                noise_sigma,
+                noise_mode,
+                channels=num_feat,
+                noise_style=noise_style,
+                init_gain=noise_init_gain,
+            )
+            if noise_after_rrdb
+            else nn.Identity()
+        )
 
     def forward(self, x: Tensor) -> Tensor:
         out = self.RDB3(self.RDB2(self.RDB1(x)))
@@ -128,13 +177,24 @@ class ESRGANPlus(nn.Module):
         growth_channels: int = 32,
         noise_sigma: float = 0.1,
         noise_mode: NoiseMode = "train",
+        noise_style: NoiseStyle = "multiplicative",
+        noise_init_gain: float = 0.001,
+        noise_after_rrdb: bool = False,
     ) -> None:
         super().__init__()
         if scale not in (1, 2, 3, 4, 8):
             raise ValueError("ESRGANPlus supports scale 1, 2, 3, 4, or 8")
 
         body: list[nn.Module] = [
-            RRDBPlus(num_filters, growth_channels, noise_sigma, noise_mode)
+            RRDBPlus(
+                num_filters,
+                growth_channels,
+                noise_sigma,
+                noise_mode,
+                noise_style,
+                noise_init_gain,
+                noise_after_rrdb,
+            )
             for _ in range(num_blocks)
         ]
         body.append(nn.Conv2d(num_filters, num_filters, 3, 1, 1))
@@ -168,6 +228,9 @@ class ESRGANPlus(nn.Module):
             "growth_channels": growth_channels,
             "noise_sigma": noise_sigma,
             "noise_mode": noise_mode,
+            "noise_style": noise_style,
+            "noise_init_gain": noise_init_gain,
+            "noise_after_rrdb": noise_after_rrdb,
         }
 
     def forward(self, x: Tensor) -> Tensor:
@@ -177,6 +240,18 @@ class ESRGANPlus(nn.Module):
         for module in self.modules():
             if isinstance(module, GaussianNoise):
                 module.noise_mode = noise_mode
+
+    def feature_noise_gain_statistics(self) -> tuple[Tensor, Tensor] | None:
+        """Return mean and maximum absolute learned noise gains."""
+        gains = [
+            module.gain.reshape(-1)
+            for module in self.modules()
+            if isinstance(module, GaussianNoise) and module.gain is not None
+        ]
+        if not gains:
+            return None
+        absolute_gains = torch.cat(gains).abs()
+        return absolute_gains.mean(), absolute_gains.max()
 
 
 @ARCH_REGISTRY.register()

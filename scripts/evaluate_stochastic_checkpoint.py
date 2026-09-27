@@ -66,10 +66,26 @@ def main() -> None:
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--samples-per-category", type=int, default=2)
     parser.add_argument("--seeds", type=int, default=4)
+    parser.add_argument(
+        "--noise-after-rrdb",
+        action="store_true",
+        help="Reproduce experiments 1-4, which injected noise after enclosing RRDBs.",
+    )
+    parser.add_argument(
+        "--noise-style",
+        choices=("multiplicative", "learned_additive"),
+        default="multiplicative",
+    )
     args = parser.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = ESRGANPlus(scale=2, noise_sigma=0.1, noise_mode="always").to(device)
+    model = ESRGANPlus(
+        scale=2,
+        noise_sigma=0.1,
+        noise_mode="always",
+        noise_style=args.noise_style,
+        noise_after_rrdb=args.noise_after_rrdb,
+    ).to(device)
     model.load_state_dict(
         load_file(str(args.checkpoint), device=str(device)), strict=True
     )
