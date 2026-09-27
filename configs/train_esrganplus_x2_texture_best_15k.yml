@@ -1,6 +1,10 @@
-# Fifteen-thousand-step continuation of experiment 5. Photographic crops get
-# distributional texture training; text/anime crops retain a structural pixel
-# anchor and never reach the discriminator.
+# DRAFT — DO NOT START YET. Text/anime structural losses currently share the
+# stochastic forward and can suppress learned gains globally. Add a
+# deterministic/no-gain structural path and its integration tests first.
+#
+# Intended fifteen-thousand-step continuation of experiment 5. Photographic
+# crops get distributional texture training; text/anime crops retain a
+# structural pixel anchor and never reach the discriminator.
 name: 2x_ESRGANplus_texture_best_15k
 scale: 2
 use_amp: true
