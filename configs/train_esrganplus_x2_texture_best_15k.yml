@@ -1,0 +1,116 @@
+# Fifteen-thousand-step continuation of experiment 5. Photographic crops get
+# distributional texture training; text/anime crops retain a structural pixel
+# anchor and never reach the discriminator.
+name: 2x_ESRGANplus_texture_best_15k
+scale: 2
+use_amp: true
+amp_bf16: true
+use_channels_last: true
+fast_matmul: false
+use_compile: false
+num_gpu: auto
+manual_seed: 1234
+
+datasets:
+  train:
+    name: Mixed clean structure and texture train
+    type: pairedimagedataset
+    dataroot_gt:
+      - datasets/mined_hr_512_text/train/text
+      - datasets/mined_hr_512_photo/train/photo
+      - datasets/mined_hr_512_nature/train/nature
+      - datasets/mined_hr_512_anime/train/anime
+    dataroot_lq:
+      - datasets/mined_lq_x2_text/train/text
+      - datasets/mined_lq_x2_photo/train/photo
+      - datasets/mined_lq_x2_nature/train/nature
+      - datasets/mined_lq_x2_anime/train/anime
+    lq_size: 128
+    use_hflip: true
+    use_rot: true
+    num_worker_per_gpu: 8
+    batch_size_per_gpu: 8
+    accum_iter: 1
+
+network_g:
+  type: esrganplus
+  num_filters: 64
+  num_blocks: 23
+  growth_channels: 32
+  noise_mode: always
+  noise_style: learned_additive
+  noise_init_gain: 0.001
+  noise_after_rrdb: false
+
+network_d:
+  type: unetdiscriminatorsn
+  num_feat: 64
+  skip_connection: true
+
+path:
+  pretrain_network_g: experiments/2x_ESRGANplus_texture_exp5_learned_gan/models/net_g_ema_2500.safetensors
+  pretrain_network_g_ema: experiments/2x_ESRGANplus_texture_exp5_learned_gan/models/net_g_ema_2500.safetensors
+  pretrain_network_d: experiments/2x_ESRGANplus_texture_exp5_learned_gan/models/resume_models/net_d_2500.safetensors
+  param_key_g: ~
+  param_key_d: ~
+  strict_load_g: true
+  strict_load_d: true
+  resume_state: ~
+
+train:
+  ema_decay: 0.999
+  ema_power: 0.75
+  grad_clip: true
+  grad_clip_max_norm: 1.0
+  stochastic_second_pass: true
+  stochastic_diversity_weight: 0.0
+  stochastic_low_frequency_weight: 0.0
+  stochastic_smooth_region_weight: 0.0
+  stochastic_detail_threshold: 0.01
+  stochastic_filter_size: 15
+  optim_g:
+    type: AdamW
+    lr: !!float 1e-5
+    weight_decay: 0
+    betas: [0.9, 0.99]
+  optim_d:
+    type: AdamW
+    lr: !!float 5e-5
+    weight_decay: 0
+    betas: [0.9, 0.99]
+  scheduler:
+    type: MultiStepLR
+    milestones: [9000, 13000]
+    gamma: 0.5
+  total_iter: 15000
+  warmup_iter: 100
+  losses:
+    - type: lpipsloss
+      net: vgg
+      loss_weight: 1.0
+      path_contains: ["/photo/", "/nature/"]
+    - type: averageloss
+      criterion: l1
+      scale: 8
+      loss_weight: 0.02
+    - type: charbonnierloss
+      loss_weight: 0.1
+      path_contains: ["/text/", "/anime/"]
+    - type: ganloss
+      gan_type: hinge
+      loss_weight: 0.005
+      path_contains: ["/photo/", "/nature/"]
+
+val:
+  val_enabled: false
+  val_freq: 500
+  save_img: false
+  stochastic_samples: 4
+  stochastic_seed: 0
+  metrics_enabled: false
+
+logger:
+  print_freq: 100
+  save_checkpoint_freq: 500
+  save_checkpoint_format: safetensors
+  use_tb_logger: true

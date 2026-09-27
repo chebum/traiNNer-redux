@@ -25,3 +25,8 @@ test -f "$checkpoint"
     --samples-per-category 2 \
     --seeds 4 \
     --noise-style learned_additive
+
+# Continue the best architecture with domain-routed objectives. This remains in
+# the same detached, sleep-inhibited service after the short-run evaluation.
+"$uv_bin" run python train.py --auto_resume \
+    -opt configs/train_esrganplus_x2_texture_best_15k.yml
