@@ -4,7 +4,8 @@ The deterministic module names match the locally deployed SSIU checkpoints.
 The optional stochastic paths are initialized to preserve the pretrained
 model's output.  The legacy texture head adds a high-pass RGB residual, while
 deep feature noise gives late SSIU blocks spatial randomness that they can
-turn into structured texture.
+turn into structured texture. Optional ESRGAN+-style paths add two
+zero-initialized cross-stage shortcuts inside every recurrent module.
 """
 
 from __future__ import annotations
@@ -20,6 +21,34 @@ from torch import Tensor, nn
 from traiNNer.utils.registry import ARCH_REGISTRY
 
 NoiseMode = Literal["train", "always", "disabled"]
+
+_TRAINING_STATE_DICT_RENAMES = (
+    (".norm.body.", ".norm.norm."),
+    (".s1.", ".sparse_constraint."),
+    (".s2.", ".similarity_constraint."),
+    (".s3.", ".attention."),
+    (".s4.", ".aggregate."),
+    (".ffn.", ".feed_forward."),
+    (".project_in1.", ".direct."),
+    (".project_in2.", ".local."),
+    (".project_out.", ".output."),
+    (".LocalProp.", ".local_propagation."),
+    (".rel_h", ".relative_height"),
+    (".rel_w", ".relative_width"),
+    (".qkv_conv.", ".qkv."),
+    ("moe.fc_a.", "moe.weight_a."),
+    ("moe.fc_b.", "moe.weight_b."),
+    ("moe.fc_c.", "moe.weight_c."),
+)
+
+
+class ZeroInitializedConv2d(nn.Conv2d):
+    """A convolution whose construction does not advance the random stream."""
+
+    def reset_parameters(self) -> None:
+        nn.init.zeros_(self.weight)
+        if self.bias is not None:
+            nn.init.zeros_(self.bias)
 
 
 class LearnedFeatureNoise(nn.Module):
@@ -48,7 +77,16 @@ class LearnedFeatureNoise(nn.Module):
         )
         if not enabled:
             return features
-        return features + torch.randn_like(features) * self.gain
+        # One spatial noise field is broadcast through learned per-feature
+        # gains, matching the StyleGAN-like mechanism described by ESRGAN+.
+        noise = torch.randn(
+            features.shape[0],
+            1,
+            *features.shape[-2:],
+            device=features.device,
+            dtype=features.dtype,
+        )
+        return features + noise * self.gain
 
 
 class StochasticTextureHead(nn.Module):
@@ -150,7 +188,9 @@ class SSIU(nn.Module):
         texture_init_std: float = 1e-5,
         train_texture_only: bool = False,
         stochastic_feature_blocks: int = 0,
+        stochastic_internal_residuals: bool = False,
         feature_noise_init_gain: float = 0.0,
+        plus_residuals: bool = False,
         train_late_blocks: int = 0,
     ) -> None:
         super().__init__()
@@ -186,6 +226,10 @@ class SSIU(nn.Module):
                 block_size=8,
                 kernel_size=3,
                 reduction=2,
+                stochastic_internal_residuals=stochastic_internal_residuals,
+                noise_mode=noise_mode,
+                feature_noise_init_gain=feature_noise_init_gain,
+                plus_residuals=plus_residuals,
             )
             for _ in range(n_blocks)
         )
@@ -265,12 +309,27 @@ class SSIU(nn.Module):
 
     def feature_noise_gain_statistics(self) -> tuple[Tensor, Tensor] | None:
         """Return mean and maximum absolute deep-noise gain for diagnostics."""
-        if not self.feature_noise:
+        noise_modules = [
+            module for module in self.modules() if isinstance(module, LearnedFeatureNoise)
+        ]
+        if not noise_modules:
             return None
-        gains = torch.cat(
-            [module.gain.reshape(-1) for module in self.feature_noise.values()]
-        ).abs()
+        gains = torch.cat([module.gain.reshape(-1) for module in noise_modules]).abs()
         return gains.mean(), gains.max()
+
+    def map_state_dict(self, state_dict: Mapping[str, Tensor]) -> dict[str, Tensor]:
+        """Map original SSUFSR/DataParallel names to this implementation."""
+        converted: dict[str, Tensor] = {}
+        for source_key, value in state_dict.items():
+            key = source_key.removeprefix("module.")
+            for training_name, runtime_name in _TRAINING_STATE_DICT_RENAMES:
+                key = key.replace(training_name, runtime_name)
+            if key in converted:
+                raise ValueError(
+                    f"SSIU state dict keys map to the same runtime key: {key}"
+                )
+            converted[key] = value
+        return converted
 
     def forward(self, image: Tensor) -> Tensor:
         height, width = image.shape[-2:]
@@ -303,7 +362,7 @@ class SSIU(nn.Module):
         assign: bool = False,
     ) -> Any:
         incompatible = super().load_state_dict(
-            state_dict, strict=strict, assign=assign
+            self.map_state_dict(state_dict), strict=strict, assign=assign
         )
         if not strict:
             permitted_missing_prefixes = ["feature_noise."]
@@ -313,10 +372,13 @@ class SSIU(nn.Module):
                 key
                 for key in incompatible.missing_keys
                 if not key.startswith(tuple(permitted_missing_prefixes))
+                and ".residual_noise." not in key
+                and ".plus_input_projection." not in key
+                and not key.endswith(".plus_long_skip_gain")
             ]
             if invalid_missing or incompatible.unexpected_keys:
                 raise RuntimeError(
-                    "Stochastic SSIU checkpoint mismatch outside texture_head: "
+                    "SSIU checkpoint mismatch outside optional paths: "
                     f"missing={invalid_missing}, "
                     f"unexpected={incompatible.unexpected_keys}"
                 )
@@ -365,6 +427,10 @@ class SSIURecurrentModule(nn.Module):
         block_size: int,
         kernel_size: int,
         reduction: int,
+        stochastic_internal_residuals: bool,
+        noise_mode: NoiseMode,
+        feature_noise_init_gain: float,
+        plus_residuals: bool,
     ) -> None:
         super().__init__()
         self.norm = LayerNorm2d(channels)
@@ -382,6 +448,26 @@ class SSIURecurrentModule(nn.Module):
         )
         self.aggregate = MixedScaleGating(channels, kernel_size=kernel_size)
         self.feed_forward = MixedScaleGating(channels, kernel_size=kernel_size)
+        self.plus_input_projection = (
+            ZeroInitializedConv2d(channels, channels, 1) if plus_residuals else None
+        )
+        self.plus_long_skip_gain = (
+            nn.Parameter(torch.zeros(1, channels, 1, 1))
+            if plus_residuals
+            else None
+        )
+        self.residual_noise = nn.ModuleList(
+            [
+                LearnedFeatureNoise(
+                    channels=channels,
+                    noise_mode=noise_mode,
+                    init_gain=feature_noise_init_gain,
+                )
+                for _ in range(3)
+            ]
+            if stochastic_internal_residuals
+            else []
+        )
 
     def forward(self, features: Tensor, shallow: Tensor) -> Tensor:
         normalized = self.norm(features)
@@ -389,8 +475,23 @@ class SSIURecurrentModule(nn.Module):
         similar = self.similarity_constraint(normalized)
         attended_input = normalized + sparse + shallow
         attended = self.attention(attended_input) + attended_input
+        if self.plus_input_projection is not None:
+            # ESRGAN+ analogue of x2 += conv1x1(x). The zero initialization
+            # exactly preserves a deterministic checkpoint at step zero.
+            attended = attended + self.plus_input_projection(normalized)
+        if self.residual_noise:
+            attended = self.residual_noise[0](attended)
         features = self.aggregate(attended - similar) + similar
-        return self.feed_forward(features) + features
+        if self.plus_long_skip_gain is not None:
+            # ESRGAN+ analogue of x4 += x2. A learned per-channel zero gate
+            # keeps the pre-existing SSIU function unchanged on initialization.
+            features = features + attended * self.plus_long_skip_gain
+        if self.residual_noise:
+            features = self.residual_noise[1](features)
+        features = self.feed_forward(features) + features
+        if self.residual_noise:
+            features = self.residual_noise[2](features)
+        return features
 
 
 class EfficientSparseAttention(nn.Module):

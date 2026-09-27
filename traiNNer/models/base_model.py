@@ -602,7 +602,7 @@ class BaseModel:
             net = self.get_bare_model(net)
             if load_path.endswith(".safetensors"):
                 load_net: StateDict = load_file(load_path, device=str(self.device))
-            elif load_path.endswith(".pth"):
+            elif load_path.endswith((".pth", ".pt")):
                 load_net = torch.load(
                     load_path,
                     map_location="cpu",
