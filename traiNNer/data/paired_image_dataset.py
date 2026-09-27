@@ -79,6 +79,8 @@ class PairedImageDataset(BaseDataset):
             self.paths = paired_paths_from_folder(
                 (self.lq_folder, self.gt_folder), ("lq", "gt"), self.filename_tmpl
             )
+        if opt.max_dataset_size > 0:
+            self.paths = self.paths[: opt.max_dataset_size]
 
     def __getitem__(self, index: int) -> DataFeed:
         if self.file_client is None:

@@ -2,6 +2,7 @@ import os
 import shutil
 import warnings
 from collections import OrderedDict
+from contextlib import nullcontext
 from os import path as osp
 from typing import Any
 
@@ -31,6 +32,7 @@ from traiNNer.metrics.stochastic import (
 from traiNNer.models.base_model import BaseModel
 from traiNNer.utils import get_root_logger, imwrite, tensor2img
 from traiNNer.utils.color_util import pixelformat2rgb_pt, rgb2pixelformat_pt
+from traiNNer.utils.device import empty_device_cache
 from traiNNer.utils.eco import compute_alpha, eco_synthesize
 from traiNNer.utils.logger import clickable_file_path
 from traiNNer.utils.misc import loss_type_to_label
@@ -47,6 +49,54 @@ def select_path_indices(paths: list[str], markers: tuple[str, ...]) -> list[int]
     ]
 
 
+def _stochastic_frequency_deltas(
+    first: Tensor,
+    second: Tensor,
+    target: Tensor,
+    filter_size: int,
+    detail_threshold: float,
+) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+    """Return low-, global high-, detail-, and smooth-region deltas."""
+    if filter_size < 3 or filter_size % 2 == 0:
+        raise ValueError(
+            "train.stochastic_filter_size must be an odd integer of at least 3"
+        )
+    if detail_threshold <= 0:
+        raise ValueError(
+            "train.stochastic_detail_threshold must be greater than zero"
+        )
+    filter_radius = filter_size // 2
+    padding = (filter_radius,) * 4
+
+    def low_pass(value: Tensor) -> Tensor:
+        return F.avg_pool2d(
+            F.pad(value, padding, mode="reflect"), filter_size, stride=1
+        )
+
+    first_low = low_pass(first)
+    second_low = low_pass(second)
+    low_delta = F.l1_loss(first_low, second_low)
+    high_difference = torch.abs(
+        (first - first_low) - (second - second_low)
+    )
+    high_delta = high_difference.mean()
+    target_low = low_pass(target)
+    detail_weight = (
+        torch.abs(target - target_low).mean(dim=1, keepdim=True)
+        / detail_threshold
+    ).clamp(max=1)
+    detail_weight_sum = detail_weight.sum().clamp_min(1e-6)
+    detail_high_delta = (high_difference * detail_weight).sum() / (
+        detail_weight_sum * high_difference.shape[1]
+    )
+    smooth_weight = 1 - detail_weight
+    smooth_weight_sum = smooth_weight.sum().clamp_min(1e-6)
+    smooth_high_delta = (high_difference * smooth_weight).sum() / (
+        smooth_weight_sum * high_difference.shape[1]
+    )
+    return low_delta, high_delta, detail_high_delta, smooth_high_delta
+
+
 class SRModel(BaseModel):
     """Base SR model for single image super-resolution."""
 
@@ -57,6 +107,12 @@ class SRModel(BaseModel):
 
         # use amp
         self.use_amp = self.opt.use_amp
+        if self.use_amp and self.device.type != "cuda":
+            get_root_logger().warning(
+                "AMP is currently supported only on CUDA; disabling AMP on %s.",
+                self.device.type.upper(),
+            )
+            self.use_amp = False
         self.use_channels_last = self.opt.use_channels_last
         self.memory_format = (
             torch.channels_last
@@ -103,6 +159,7 @@ class SRModel(BaseModel):
         self.lq: Tensor | None = None
         self.gt: Tensor | None = None
         self.output: Tensor | None = None
+        self.validation_outputs: list[Tensor] = []
         self._real_hr: Tensor | None = None
         logger = get_root_logger()
 
@@ -135,7 +192,7 @@ class SRModel(BaseModel):
                 opt.train.total_iter,
             )
 
-        if self.use_amp:
+        if self.use_amp and self.device.type == "cuda":
             if self.amp_dtype == torch.bfloat16 and not torch.cuda.is_bf16_supported():
                 logger.warning(
                     "bf16 was enabled for AMP but the current GPU does not support bf16. Falling back to float16 for AMP. Disable bf16 to hide this warning (amp_bf16: false)."
@@ -244,7 +301,9 @@ class SRModel(BaseModel):
 
         logger = get_root_logger()
 
-        enable_gradscaler = self.use_amp and not self.opt.amp_bf16
+        enable_gradscaler = (
+            self.device.type == "cuda" and self.use_amp and not self.opt.amp_bf16
+        )
 
         self.scaler_g = GradScaler(enabled=enable_gradscaler, device="cuda")
         self.scaler_d = GradScaler(enabled=enable_gradscaler, device="cuda")
@@ -453,6 +512,10 @@ class SRModel(BaseModel):
         # assert train_opt.optim_g is not None
         optim_params = []
         logger = get_root_logger()
+        intentional_frozen_count = 0
+        intentional_freeze_check = getattr(
+            self.net_g, "is_parameter_intentionally_frozen", None
+        )
 
         if train_opt.optim_g is not None:
             for k, v in self.net_g.named_parameters():
@@ -460,8 +523,17 @@ class SRModel(BaseModel):
                     optim_params.append(v)
                 elif "eval_" in k:
                     pass  # intentionally frozen for reparameterization, skip warning
+                elif callable(intentional_freeze_check) and intentional_freeze_check(k):
+                    intentional_frozen_count += 1
                 else:
                     logger.warning("Params %s will not be optimized.", k)
+
+            if intentional_frozen_count:
+                logger.info(
+                    "Intentionally froze %d generator parameters; optimizing %d trainable tensors.",
+                    intentional_frozen_count,
+                    len(optim_params),
+                )
 
             self.optimizer_g = self.get_optimizer(optim_params, train_opt.optim_g)
             self.optimizers.append(self.optimizer_g)
@@ -580,6 +652,8 @@ class SRModel(BaseModel):
         assert self.gt is not None
         assert self.scaler_d is not None
         assert self.scaler_g is not None
+        train_opt = self.opt.train
+        assert train_opt is not None
 
         skip_d_update = False
 
@@ -607,6 +681,18 @@ class SRModel(BaseModel):
 
                 assert isinstance(self.output, Tensor)
                 l_g_total = torch.tensor(0.0, device=self.output.device)
+
+                gain_statistics = getattr(
+                    self.get_bare_model(self.net_g),
+                    "feature_noise_gain_statistics",
+                    None,
+                )
+                if callable(gain_statistics):
+                    statistics = gain_statistics()
+                    if statistics is not None:
+                        gain_mean, gain_max = statistics
+                        loss_dict["stochastic_gain_mean"] = gain_mean.detach()
+                        loss_dict["stochastic_gain_max"] = gain_max.detach()
 
                 lq_target = None
                 alternate_output = None
@@ -707,6 +793,75 @@ class SRModel(BaseModel):
                         weighted_l_g_loss = l_g_loss * abs(loss.loss_weight)
                         l_g_total += weighted_l_g_loss / self.accum_iters
                         loss_dict[label] = weighted_l_g_loss
+
+                if train_opt.stochastic_second_pass:
+                    filter_size = train_opt.stochastic_filter_size
+                    stochastic_objective_enabled = any(
+                        weight > 0
+                        for weight in (
+                            train_opt.stochastic_diversity_weight,
+                            train_opt.stochastic_low_frequency_weight,
+                            train_opt.stochastic_smooth_region_weight,
+                        )
+                    )
+                    gradient_context = (
+                        nullcontext()
+                        if stochastic_objective_enabled
+                        else torch.no_grad()
+                    )
+                    with gradient_context:
+                        second_output = pixelformat2rgb_pt(
+                            self.net_g(lq), self.gt, self.opt.output_pixel_format
+                        )
+                        (
+                            low_delta,
+                            high_delta,
+                            detail_high_delta,
+                            smooth_high_delta,
+                        ) = _stochastic_frequency_deltas(
+                            self.output,
+                            second_output,
+                            self.gt,
+                            filter_size,
+                            train_opt.stochastic_detail_threshold,
+                        )
+                    loss_dict["stochastic_hf_delta"] = high_delta.detach()
+                    loss_dict["stochastic_detail_hf_delta"] = (
+                        detail_high_delta.detach()
+                    )
+                    loss_dict["stochastic_lf_delta"] = low_delta.detach()
+                    loss_dict["stochastic_smooth_hf_delta"] = (
+                        smooth_high_delta.detach()
+                    )
+
+                    if train_opt.stochastic_diversity_weight > 0:
+                        diversity_loss = F.relu(
+                            high_delta.new_tensor(
+                                train_opt.stochastic_diversity_target
+                            )
+                            - detail_high_delta
+                        ) * train_opt.stochastic_diversity_weight
+                        l_g_total += diversity_loss / self.accum_iters
+                        loss_dict["l_g_stochastic_diversity"] = diversity_loss
+
+                    if train_opt.stochastic_low_frequency_weight > 0:
+                        low_frequency_loss = (
+                            low_delta * train_opt.stochastic_low_frequency_weight
+                        )
+                        l_g_total += low_frequency_loss / self.accum_iters
+                        loss_dict["l_g_stochastic_low_frequency"] = (
+                            low_frequency_loss
+                        )
+
+                    if train_opt.stochastic_smooth_region_weight > 0:
+                        smooth_region_loss = (
+                            smooth_high_delta
+                            * train_opt.stochastic_smooth_region_weight
+                        )
+                        l_g_total += smooth_region_loss / self.accum_iters
+                        loss_dict["l_g_stochastic_smooth_region"] = (
+                            smooth_region_loss
+                        )
 
                 if not l_g_total.isfinite():
                     self.nan_count += 1
@@ -930,23 +1085,38 @@ class SRModel(BaseModel):
             sample_count = self.opt.val.stochastic_samples
             if sample_count < 1:
                 raise ValueError("val.stochastic_samples must be at least 1")
-            devices = [self.device] if self.device.type == "cuda" else []
-            self.validation_outputs: list[Tensor] = []
-            with torch.inference_mode(), torch.random.fork_rng(devices=devices):
-                for sample_index in range(sample_count):
-                    sample_seed = self.opt.val.stochastic_seed + sample_index
-                    torch.manual_seed(sample_seed)
-                    if self.device.type == "cuda":
-                        torch.cuda.manual_seed_all(sample_seed)
-                    if self.opt.val.tile_size > 0:
-                        tmp_out = self.infer_tiled(net, lq)
-                    else:
-                        tmp_out = net(lq)
-                    self.validation_outputs.append(
-                        pixelformat2rgb_pt(
-                            tmp_out, self.gt, self.opt.output_pixel_format
+            self.validation_outputs = []
+            cpu_rng_state = torch.random.get_rng_state()
+            cuda_rng_states = (
+                torch.cuda.get_rng_state_all() if self.device.type == "cuda" else None
+            )
+            mps_rng_state = (
+                torch.mps.get_rng_state() if self.device.type == "mps" else None
+            )
+            try:
+                with torch.inference_mode():
+                    for sample_index in range(sample_count):
+                        sample_seed = self.opt.val.stochastic_seed + sample_index
+                        torch.manual_seed(sample_seed)
+                        if self.device.type == "cuda":
+                            torch.cuda.manual_seed_all(sample_seed)
+                        elif self.device.type == "mps":
+                            torch.mps.manual_seed(sample_seed)
+                        if self.opt.val.tile_size > 0:
+                            tmp_out = self.infer_tiled(net, lq)
+                        else:
+                            tmp_out = net(lq)
+                        self.validation_outputs.append(
+                            pixelformat2rgb_pt(
+                                tmp_out, self.gt, self.opt.output_pixel_format
+                            )
                         )
-                    )
+            finally:
+                torch.random.set_rng_state(cpu_rng_state)
+                if cuda_rng_states is not None:
+                    torch.cuda.set_rng_state_all(cuda_rng_states)
+                if mps_rng_state is not None:
+                    torch.mps.set_rng_state(mps_rng_state)
 
             # The fixed first seed is the deployable primary result. Other
             # samples are diagnostics only and must never act as a GT oracle.
@@ -1054,7 +1224,7 @@ class SRModel(BaseModel):
             # tentative for out of GPU memory
             self.lq = None
             self.output = None
-            torch.cuda.empty_cache()
+            empty_device_cache(self.device)
 
             save_img_dir = None
 

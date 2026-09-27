@@ -32,6 +32,7 @@ from traiNNer.schedulers.cosineannealingwarmuplr_scheduler import (
 )
 from traiNNer.schedulers.kneelr_scheduler import KneeLR
 from traiNNer.utils import get_root_logger
+from traiNNer.utils.device import resolve_device
 from traiNNer.utils.dist_util import master_only
 from traiNNer.utils.logger import clickable_file_path
 from traiNNer.utils.misc import is_json_compatible, require_triton
@@ -44,7 +45,8 @@ class BaseModel:
 
     def __init__(self, opt: ReduxOptions) -> None:
         self.opt = opt
-        self.device = torch.device("cuda" if opt.num_gpu != 0 else "cpu")
+        assert isinstance(opt.num_gpu, int)
+        self.device = resolve_device(opt.device, opt.num_gpu)
         self.is_train = opt.is_train
         self.schedulers: list[LRScheduler] = []
         self.optimizers: list[Optimizer] = []
@@ -219,6 +221,8 @@ class BaseModel:
             net = torch.compile(net, mode=self.opt.compile_mode)  # pyright: ignore[reportAssignmentType]
 
         if self.opt.dist:
+            if self.device.type != "cuda":
+                raise RuntimeError("Distributed training is currently supported only on CUDA")
             find_unused_parameters = self.opt.find_unused_parameters
             net = DistributedDataParallel(
                 net,

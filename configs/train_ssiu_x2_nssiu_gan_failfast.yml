@@ -1,0 +1,140 @@
+# Fail-fast nSSIU-GAN experiment. Deep learned feature noise and a small GAN
+# objective test whether SSIU can synthesize seed-dependent photographic texture.
+name: 2x_SSIU_nssiu_gan_failfast
+scale: 2
+use_amp: false
+amp_bf16: false
+use_channels_last: false
+fast_matmul: false
+use_compile: false
+num_gpu: auto
+device: mps
+manual_seed: 1234
+
+datasets:
+  train:
+    name: Clean photo and nature train
+    type: pairedimagedataset
+    dataroot_gt:
+      - datasets/mined_hr_512_photo/train/photo
+      - datasets/mined_hr_512_nature/train/nature
+    dataroot_lq:
+      - datasets/mined_lq_x2_photo/train/photo
+      - datasets/mined_lq_x2_nature/train/nature
+    # Keep the first GAN experiment small enough for MPS unified memory.
+    lq_size: 96
+    use_hflip: true
+    use_rot: true
+    num_worker_per_gpu: 4
+    batch_size_per_gpu: 2
+    accum_iter: 4
+  val_photo:
+    name: Clean photo nSSIU-GAN val
+    type: pairedimagedataset
+    dataroot_gt: [datasets/mined_hr_512_photo/val/photo]
+    dataroot_lq: [datasets/mined_lq_x2_photo/val/photo]
+    max_dataset_size: 16
+  val_nature:
+    name: Clean nature nSSIU-GAN val
+    type: pairedimagedataset
+    dataroot_gt: [datasets/mined_hr_512_nature/val/nature]
+    dataroot_lq: [datasets/mined_lq_x2_nature/val/nature]
+    max_dataset_size: 16
+
+network_g:
+  type: SSIU
+  colors: 3
+  n_feats: 64
+  n_blocks: 9
+  # Inject learned per-channel Gaussian noise after the last three recurrent
+  # blocks. A tiny nonzero gain breaks the zero-mean gradient symmetry while
+  # keeping the initial output visually equivalent to the pretrained model.
+  stochastic_feature_blocks: 3
+  feature_noise_init_gain: 0.001
+  noise_mode: always
+  # Let the last three blocks, MoE, and reconstruction tail learn to turn the
+  # injected noise into structured texture; preserve early structural features.
+  train_late_blocks: 3
+
+network_d:
+  type: UNetDiscriminatorSN
+  num_in_ch: 3
+  num_feat: 32
+  skip_connection: true
+
+path:
+  pretrain_network_g: /Users/ivannikitin/PycharmProjects/AI_watermark_worker/models/SSIU/SSIU-x2-clean70-jpeg30-perceptual.safetensors
+  param_key_g: ~
+  strict_load_g: false
+  resume_state: ~
+
+train:
+  ema_decay: 0.999
+  ema_power: 0.75
+  grad_clip: true
+  grad_clip_max_norm: 1.0
+  # The second pass is diagnostic only: there is deliberately no hand-written
+  # diversity floor. TensorBoard records seed deltas and learned gain sizes.
+  stochastic_second_pass: true
+  stochastic_diversity_weight: 0.0
+  stochastic_low_frequency_weight: 0.0
+  stochastic_smooth_region_weight: 0.0
+  stochastic_detail_threshold: 0.01
+  stochastic_filter_size: 15
+  optim_g:
+    type: AdamW
+    lr: !!float 2e-5
+    weight_decay: 0
+    betas: [0.9, 0.99]
+  optim_d:
+    type: AdamW
+    lr: !!float 1e-4
+    weight_decay: 0
+    betas: [0.9, 0.99]
+  scheduler:
+    type: MultiStepLR
+    milestones: [1500, 2200]
+    gamma: 0.5
+  total_iter: 2500
+  warmup_iter: 100
+  losses:
+    # Paired content constraint. It should preserve semantic structure while
+    # tolerating small local texture changes better than a full RGB loss.
+    - type: lpipsloss
+      net: vgg
+      loss_weight: 1.0
+    # Weak block-averaged L1 anchor for color and low-frequency geometry.
+    - type: averageloss
+      criterion: l1
+      scale: 8
+      loss_weight: 0.02
+    # Distributional realism signal; no explicit seed-diversity objective.
+    - type: ganloss
+      gan_type: hinge
+      loss_weight: 0.005
+
+val:
+  val_enabled: true
+  val_freq: 250
+  save_img: true
+  tile_size: 0
+  tile_overlap: 0
+  stochastic_samples: 4
+  stochastic_seed: 0
+  stochastic_selection: first
+  metrics_enabled: true
+  metrics:
+    psnr:
+      type: calculate_psnr
+      crop_border: 2
+      test_y_channel: false
+    ssim:
+      type: calculate_ssim
+      crop_border: 2
+      test_y_channel: false
+
+logger:
+  print_freq: 25
+  save_checkpoint_freq: 250
+  save_checkpoint_format: safetensors
+  use_tb_logger: true

@@ -12,6 +12,7 @@ from rich.logging import RichHandler
 from rich.markup import escape
 from torch.utils.tensorboard.writer import SummaryWriter
 
+from traiNNer.utils.device import mps_is_available, resolve_device
 from traiNNer.utils.dist_util import get_dist_info, master_only
 from traiNNer.utils.misc import free_space_gb_str
 from traiNNer.utils.redux_options import ReduxOptions
@@ -87,6 +88,8 @@ class MessageLogger:
         self.max_iters = opt.train.total_iter
         self.use_tb_logger = opt.logger.use_tb_logger
         self.tb_logger = tb_logger
+        assert isinstance(opt.num_gpu, int)
+        self.device = resolve_device(opt.device, opt.num_gpu)
 
         self.start_time = time.time()
         self.logger = get_root_logger()
@@ -127,10 +130,14 @@ class MessageLogger:
 
             message += f"[performance: {iter_time:.3f} it/s] [eta: {eta_str}] "
 
-        # peak VRAM
-        message += (
-            f"[peak VRAM: {torch.cuda.max_memory_allocated() / (1024**3):.2f} GB] "
-        )
+        if self.device.type == "cuda":
+            message += (
+                f"[peak VRAM: {torch.cuda.max_memory_allocated() / (1024**3):.2f} GB] "
+            )
+        elif self.device.type == "mps":
+            message += (
+                f"[MPS memory: {torch.mps.current_allocated_memory() / (1024**3):.2f} GB] "
+            )
 
         # Log any additional variables (typically losses)
         for k, v in log_vars.items():
@@ -245,7 +252,7 @@ def get_root_logger(
     return logger
 
 
-def get_env_info() -> str:
+def get_env_info(device: torch.device | None = None) -> str:
     """Get environment information.
 
     Currently, only log the software version.
@@ -253,18 +260,31 @@ def get_env_info() -> str:
     import torch
     import torchvision
 
-    device_info = torch.cuda.get_device_properties(torch.cuda.current_device())
-
     # from traiNNer.version import __version__
     msg = r"[italic red]:rocket:  traiNNer-redux: good luck! :rocket:[/]"
+    if device is None:
+        if torch.cuda.is_available():
+            device = torch.device("cuda")
+        elif mps_is_available():
+            device = torch.device("mps")
+        else:
+            device = torch.device("cpu")
+    msg += "\nSystem Information: "
+    if device.type == "cuda":
+        device_info = torch.cuda.get_device_properties(torch.cuda.current_device())
+        msg += (
+            "\n\tCurrent device: CUDA"
+            f"\n\t\tName: {device_info.name}"
+            f"\n\t\tTotal VRAM: {device_info.total_memory / (1024**3):.2f} GB"
+            f"\n\t\tCompute Capability: {device_info.major}.{device_info.minor}"
+            f"\n\t\tMultiprocessors: {device_info.multi_processor_count}"
+        )
+    elif device.type == "mps":
+        msg += "\n\tCurrent device: Apple Metal Performance Shaders (MPS)"
+    else:
+        msg += "\n\tCurrent device: CPU"
     msg += (
-        "\nSystem Information: "
-        f"\n\tCurrent GPU: "
-        f"\n\t\tName: {device_info.name}"
-        f"\n\t\tTotal VRAM: {device_info.total_memory / (1024**3):.2f} GB"
-        f"\n\t\tCompute Capability: {device_info.major}.{device_info.minor}"
-        f"\n\t\tMultiprocessors: {device_info.multi_processor_count}"
-        f"\n\tStorage:"
+        "\n\tStorage:"
         f"\n\t\tFree Space: {free_space_gb_str()}"
         "\nVersion Information: "
         f"\n\ttraiNNer-redux: {log_git_status()}"

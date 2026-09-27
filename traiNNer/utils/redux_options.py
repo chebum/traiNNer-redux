@@ -22,6 +22,12 @@ class DatasetOptions(StrictStruct):
         ),
     ]
     type: str
+    max_dataset_size: Annotated[
+        int,
+        Meta(
+            description="Optional deterministic cap on the number of discovered samples. Zero uses the full dataset."
+        ),
+    ] = 0
     io_backend: dict[str, Any] = field(default_factory=lambda: {"type": "disk"})
 
     num_worker_per_gpu: Annotated[
@@ -247,6 +253,48 @@ class TrainOptions(StrictStruct):
     total_iter: Annotated[
         int, Meta(description="The total number of iterations to train.")
     ]
+    stochastic_second_pass: Annotated[
+        bool,
+        Meta(
+            description="Run a second stochastic generator sample and apply the stochastic diagnostics/objectives below."
+        ),
+    ] = False
+    stochastic_diversity_weight: Annotated[
+        float,
+        Meta(
+            description="Weight of a hinge objective that prevents high-frequency variation between stochastic samples from collapsing."
+        ),
+    ] = 0.0
+    stochastic_diversity_target: Annotated[
+        float,
+        Meta(
+            description="Target mean absolute high-frequency difference between two stochastic samples in normalized RGB units."
+        ),
+    ] = 0.0
+    stochastic_detail_threshold: Annotated[
+        float,
+        Meta(
+            description="Ground-truth high-frequency magnitude mapped to full weight in the content-aware diversity objective."
+        ),
+    ] = 0.01
+    stochastic_low_frequency_weight: Annotated[
+        float,
+        Meta(
+            description="Weight penalizing low-frequency differences between stochastic samples."
+        ),
+    ] = 0.0
+    stochastic_smooth_region_weight: Annotated[
+        float,
+        Meta(
+            description="Weight penalizing high-frequency differences between stochastic samples in smooth ground-truth regions."
+        ),
+    ] = 0.0
+    stochastic_filter_size: Annotated[
+        int,
+        Meta(
+            description="Odd average-pooling kernel used to split stochastic differences into low and high frequencies."
+        ),
+    ] = 5
     adaptive_d: Annotated[
         bool,
         Meta(
@@ -456,6 +504,12 @@ class ReduxOptions(StrictStruct):
         ),
     ]
     path: PathOptions
+    device: Annotated[
+        Literal["auto", "cuda", "mps", "cpu"],
+        Meta(
+            description="Compute device. Use mps for Apple Silicon, cuda for NVIDIA, or cpu. Auto preserves the legacy num_gpu-based selection."
+        ),
+    ] = "auto"
 
     input_pixel_format: Annotated[
         PixelFormat, Meta(description="Input pixel format.")

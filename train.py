@@ -45,6 +45,7 @@ from traiNNer.utils import (
     scandir,
 )
 from traiNNer.utils.config import Config
+from traiNNer.utils.device import empty_device_cache, is_device_oom, resolve_device
 from traiNNer.utils.logger import clickable_file_path
 from traiNNer.utils.misc import (
     free_space_gb_str,
@@ -242,16 +243,11 @@ def load_resume_state(opt: ReduxOptions) -> Any | None:
 def train_pipeline(root_path: str) -> None:
     install()
 
-    if not torch.cuda.is_available():
-        raise RuntimeError(
-            "CUDA is not available. Please ensure that you have a GPU with CUDA support "
-            "and that you have installed the correct CUDA-enabled version of PyTorch. "
-            "You can check the installation guide at https://pytorch.org/get-started/locally/"
-        )
-
     # parse options, set distributed setting, set random seed
     opt, args = Config.load_config_from_file(root_path, is_train=True)
     opt.root_path = root_path
+    assert isinstance(opt.num_gpu, int)
+    device = resolve_device(opt.device, opt.num_gpu)
 
     assert opt.train is not None
     assert opt.logger is not None
@@ -260,16 +256,19 @@ def train_pipeline(root_path: str) -> None:
     assert opt.path.experiments_root is not None
     assert opt.path.log is not None
 
-    torch.cuda.set_per_process_memory_fraction(fraction=1.0)
+    if device.type == "cuda":
+        torch.cuda.set_per_process_memory_fraction(fraction=1.0)
 
     if opt.detect_anomaly:
         torch.autograd.set_detect_anomaly(True)
 
     if opt.deterministic:
-        torch.backends.cudnn.benchmark = False
+        if device.type == "cuda":
+            torch.backends.cudnn.benchmark = False
         torch.use_deterministic_algorithms(True, warn_only=True)
-        os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
-    else:
+        if device.type == "cuda":
+            os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
+    elif device.type == "cuda":
         torch.backends.cudnn.benchmark = True
     assert opt.manual_seed is not None
     set_random_seed(opt.manual_seed + opt.rank)
@@ -289,7 +288,7 @@ def train_pipeline(root_path: str) -> None:
     # Otherwise the logger will not be properly initialized
     log_file = osp.join(opt.path.log, f"train_{opt.name}_{get_time_str()}.log")
     logger = get_root_logger(logger_name="traiNNer", log_file=log_file)
-    logger.info(get_env_info())
+    logger.info(get_env_info(device))
     logger.debug(opt.contents)
     opt.contents = None
     diff, template_name = diff_user_vs_template(args.opt)
@@ -326,7 +325,8 @@ def train_pipeline(root_path: str) -> None:
 
     if opt.fast_matmul:
         torch.set_float32_matmul_precision("high")
-        torch.backends.cuda.matmul.fp32_precision = "tf32"
+        if device.type == "cuda":
+            torch.backends.cuda.matmul.fp32_precision = "tf32"
 
     # create model
     model = build_model(opt)
@@ -372,6 +372,8 @@ def train_pipeline(root_path: str) -> None:
     if prefetch_mode is None or prefetch_mode == "cpu":
         prefetcher = CPUPrefetcher(train_loader)
     elif prefetch_mode == "cuda":
+        if device.type != "cuda":
+            raise ValueError("CUDA prefetching requires device: cuda")
         prefetcher = CUDAPrefetcher(train_loader, opt)
         logger.info("Use %s prefetch dataloader", prefetch_mode)
         if not opt.datasets["train"].pin_memory:
@@ -383,7 +385,7 @@ def train_pipeline(root_path: str) -> None:
 
     # training
     gc.collect()
-    torch.cuda.empty_cache()
+    empty_device_cache(device)
 
     logger.info("Start training from epoch: %d, iter: %d.", start_epoch, current_iter)
     data_timer, iter_timer = AvgTimer(), AvgTimer()
@@ -432,14 +434,11 @@ def train_pipeline(root_path: str) -> None:
                         current_iter, current_accum_iter, apply_gradient
                     )
                 except RuntimeError as e:
-                    str_e = str(e).lower()
-                    # Check to see if its actually the CUDA out of memory error
-                    if "cuda out of memory" in str_e:
-                        # Collect garbage (clear VRAM)
+                    if is_device_oom(e, device):
                         gc.collect()
-                        torch.cuda.empty_cache()
+                        empty_device_cache(device)
                         raise RuntimeError(
-                            "Ran out of VRAM during training. Reduce lq_size or batch_size_per_gpu and try again. Ensure that no other VRAM-intensive programs are running."
+                            f"Ran out of accelerator memory on {device.type.upper()} during training. Reduce lq_size or batch_size_per_gpu and try again. Ensure that no other memory-intensive programs are running."
                         ) from None
                     else:
                         # Re-raise the exception if not an OOM error

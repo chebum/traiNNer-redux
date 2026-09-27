@@ -46,6 +46,11 @@ phase: train
     assert dataset.io_backend_opt["type"] == "disk"  # io backend
     assert len(dataset) == 3  # whether to correctly scan folders
 
+    opt.max_dataset_size = 2
+    limited_dataset = PairedImageDataset(opt)
+    assert len(limited_dataset) == 2
+    opt.max_dataset_size = 0
+
     # test __getitem__
     result = dataset.__getitem__(0)
     # check returned keys
