@@ -109,6 +109,12 @@ class DatasetOptions(StrictStruct):
             description="Filename template to use for LR images. Commonly used values might be `{}x2` or `{}x4`, which should be used if the LR dataset filename is in the format filename.png while the LR dataset filename is in the format `filename_x2.png` or `filename_x4.png`. This is common on some research datasets such as DIV2K or DF2K."
         ),
     ] = "{}"
+    degradation: Annotated[
+        dict[str, Any] | None,
+        Meta(
+            description="Optional calibrated degradation recipe for datasets that synthesize paired LQ images from clean GT images."
+        ),
+    ] = None
 
     blur_kernel_size: int = 12
     kernel_list: list[str] = field(

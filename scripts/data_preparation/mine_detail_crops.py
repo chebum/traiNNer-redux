@@ -231,42 +231,50 @@ def main() -> None:
                 return path, crops
 
             with ThreadPoolExecutor(max_workers=args.workers) as executor:
-                results = executor.map(process, paths)
-                for source_index, result in enumerate(results, start=1):
-                    if result is None:
-                        continue
-                    path, crops = result
-                    if source_index % 250 == 0:
-                        print(
-                            f"{category}: {source_index}/{len(paths)} sources, "
-                            f"{total} total crops",
-                            flush=True,
-                        )
-                    for index, (crop, box, crop_score) in enumerate(crops):
-                        identity = f"{path}:{box}".encode()
-                        stem = hashlib.blake2b(identity, digest_size=10).hexdigest()
-                        output = category_dir / f"{stem}_{index}.webp"
-                        lossless = category in TEXT_CATEGORIES
-                        save_options = {
-                            "format": "WEBP",
-                            "method": 6,
-                            "lossless": lossless,
-                        }
-                        if not lossless:
-                            save_options["quality"] = args.quality
-                        crop.save(output, **save_options)
-                        record = CropRecord(
-                            output=str(output.relative_to(args.output)),
-                            source=str(path),
-                            category=category,
-                            box=box,
-                            lossless=lossless,
-                            **asdict(crop_score),
-                        )
-                        manifest.write(
-                            json.dumps(asdict(record), sort_keys=True) + "\n"
-                        )
-                        total += 1
+                # Executor.map eagerly submits the complete iterable on Python 3.11.
+                # Large decoded source images can then accumulate behind an earlier
+                # slow result, so submit bounded batches instead.
+                batch_size = max(1, args.workers * 4)
+                for batch_start in range(0, len(paths), batch_size):
+                    batch = paths[batch_start : batch_start + batch_size]
+                    for offset, result in enumerate(
+                        executor.map(process, batch), start=1
+                    ):
+                        source_index = batch_start + offset
+                        if result is None:
+                            continue
+                        path, crops = result
+                        if source_index % 250 == 0:
+                            print(
+                                f"{category}: {source_index}/{len(paths)} sources, "
+                                f"{total} total crops",
+                                flush=True,
+                            )
+                        for index, (crop, box, crop_score) in enumerate(crops):
+                            identity = f"{path}:{box}".encode()
+                            stem = hashlib.blake2b(identity, digest_size=10).hexdigest()
+                            output = category_dir / f"{stem}_{index}.webp"
+                            lossless = category in TEXT_CATEGORIES
+                            save_options = {
+                                "format": "WEBP",
+                                "method": 6,
+                                "lossless": lossless,
+                            }
+                            if not lossless:
+                                save_options["quality"] = args.quality
+                            crop.save(output, **save_options)
+                            record = CropRecord(
+                                output=str(output.relative_to(args.output)),
+                                source=str(path),
+                                category=category,
+                                box=box,
+                                lossless=lossless,
+                                **asdict(crop_score),
+                            )
+                            manifest.write(
+                                json.dumps(asdict(record), sort_keys=True) + "\n"
+                            )
+                            total += 1
             print(f"{category}: examined {len(paths)} sources", flush=True)
     print(f"wrote {total} crops and {manifest_path}")
 
