@@ -6,6 +6,7 @@ from itertools import combinations
 from statistics import fmean, pstdev
 from typing import Literal
 
+import torch
 from torch import Tensor
 from torch.nn import functional as F  # noqa: N812
 
@@ -24,7 +25,11 @@ def summarize_seed_metrics(
 
 
 def stochastic_output_diagnostics(
-    outputs: list[Tensor], lq: Tensor
+    outputs: list[Tensor],
+    lq: Tensor,
+    target: Tensor | None = None,
+    *,
+    detail_threshold: float = 0.01,
 ) -> dict[str, float]:
     """Measure LR consistency and whether seed variation is high-frequency."""
     if len(outputs) < 2:
@@ -59,9 +64,47 @@ def stochastic_output_diagnostics(
     high_diversity = fmean(
         F.l1_loss(left, right).item() for left, right in combinations(high_frequency, 2)
     )
-    return {
+    diagnostics = {
         "lr_consistency_proxy_l1": consistency,
         "lowfreq_diversity_l1": low_diversity,
         "highfreq_diversity_l1": high_diversity,
         "high_to_low_diversity": high_diversity / max(low_diversity, 1e-12),
     }
+    if target is None:
+        return diagnostics
+    if detail_threshold <= 0:
+        raise ValueError("detail_threshold must be greater than zero")
+
+    target_low = F.avg_pool2d(
+        F.pad(target.float(), (2, 2, 2, 2), mode="reflect"),
+        kernel_size=5,
+        stride=1,
+    )
+    detail_weight = (
+        torch.abs(target.float() - target_low).mean(dim=1, keepdim=True)
+        / detail_threshold
+    ).clamp(max=1)
+    smooth_weight = 1 - detail_weight
+
+    def weighted_delta(difference: Tensor, weight: Tensor) -> float:
+        denominator = weight.sum().clamp_min(1e-6) * difference.shape[1]
+        return ((difference * weight).sum() / denominator).item()
+
+    detail_deltas: list[float] = []
+    smooth_deltas: list[float] = []
+    for left, right in combinations(high_frequency, 2):
+        difference = torch.abs(left - right)
+        detail_deltas.append(weighted_delta(difference, detail_weight))
+        smooth_deltas.append(weighted_delta(difference, smooth_weight))
+
+    detail_diversity = fmean(detail_deltas)
+    smooth_diversity = fmean(smooth_deltas)
+    diagnostics.update(
+        {
+            "detail_highfreq_diversity_l1": detail_diversity,
+            "smooth_highfreq_diversity_l1": smooth_diversity,
+            "detail_to_smooth_diversity": detail_diversity
+            / max(smooth_diversity, 1e-12),
+        }
+    )
+    return diagnostics

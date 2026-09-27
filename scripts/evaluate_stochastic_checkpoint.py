@@ -102,6 +102,7 @@ def main() -> None:
             lq_image = load_rgb(lq_path)
             gt_image = load_rgb(gt_path)
             lq = to_tensor(lq_image, device)
+            gt = to_tensor(gt_image, device)
             outputs: list[torch.Tensor] = []
             with torch.inference_mode():
                 for seed in range(args.seeds):
@@ -109,7 +110,7 @@ def main() -> None:
                     torch.cuda.manual_seed_all(seed)
                     outputs.append(model(lq))
 
-            diagnostics = stochastic_output_diagnostics(outputs, lq)
+            diagnostics = stochastic_output_diagnostics(outputs, lq, gt)
             seed_images = [to_image(output) for output in outputs]
             psnr = [
                 calculate_psnr(image, gt_image, crop_border=2) for image in seed_images

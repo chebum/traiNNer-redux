@@ -24,3 +24,21 @@ def test_high_frequency_seed_variation_is_distinguished_from_drift() -> None:
 
     assert high_frequency["high_to_low_diversity"] > 5
     assert low_frequency["high_to_low_diversity"] < 0.1
+
+
+def test_detail_localization_distinguishes_textured_and_smooth_regions() -> None:
+    base = torch.full((1, 3, 32, 32), 0.5)
+    target = base.clone()
+    target[:, :, :, :16] += (
+        ((torch.arange(32)[:, None] + torch.arange(16)[None, :]) % 2)
+        .float()
+        .mul(0.1)
+        .unsqueeze(0)
+        .unsqueeze(0)
+    )
+    variation = torch.zeros_like(base)
+    variation[:, :, :, :16] = target[:, :, :, :16] - base[:, :, :, :16]
+    diagnostics = stochastic_output_diagnostics(
+        [base, base + variation], base, target
+    )
+    assert diagnostics["detail_to_smooth_diversity"] > 1
