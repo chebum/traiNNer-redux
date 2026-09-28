@@ -1,0 +1,117 @@
+# ESRGAN+-style cross-stage shortcuts without feature noise. This isolates the
+# architectural change under the same 3k hinge-GAN recipe as the noise runs.
+name: 2x_SSIU_plus_shortcuts_gan_3k
+scale: 2
+use_amp: false
+amp_bf16: false
+use_channels_last: false
+fast_matmul: false
+use_compile: false
+num_gpu: auto
+device: mps
+manual_seed: 1234
+
+datasets:
+  train:
+    name: Clean photo and nature train
+    type: pairedimagedataset
+    dataroot_gt:
+      - datasets/mined_hr_512_photo/train/photo
+      - datasets/mined_hr_512_nature/train/nature
+    dataroot_lq:
+      - datasets/mined_lq_x2_photo/train/photo
+      - datasets/mined_lq_x2_nature/train/nature
+    lq_size: 96
+    use_hflip: true
+    use_rot: true
+    num_worker_per_gpu: 4
+    batch_size_per_gpu: 2
+    accum_iter: 4
+  val_photo:
+    name: Clean photo plus-shortcut val
+    type: pairedimagedataset
+    dataroot_gt: [datasets/mined_hr_512_photo/val/photo]
+    dataroot_lq: [datasets/mined_lq_x2_photo/val/photo]
+    max_dataset_size: 16
+  val_nature:
+    name: Clean nature plus-shortcut val
+    type: pairedimagedataset
+    dataroot_gt: [datasets/mined_hr_512_nature/val/nature]
+    dataroot_lq: [datasets/mined_lq_x2_nature/val/nature]
+    max_dataset_size: 16
+
+network_g:
+  type: SSIU
+  colors: 3
+  n_feats: 64
+  n_blocks: 9
+  plus_residuals: true
+
+network_d:
+  type: UNetDiscriminatorSN
+  num_in_ch: 3
+  num_feat: 32
+  skip_connection: true
+
+path:
+  pretrain_network_g: checkpoints/SSIU/clean_control_x2_best_epoch3.pt
+  param_key_g: ~
+  strict_load_g: false
+  resume_state: ~
+
+train:
+  ema_decay: 0.999
+  ema_power: 0.75
+  grad_clip: true
+  grad_clip_max_norm: 1.0
+  stochastic_second_pass: false
+  optim_g:
+    type: AdamW
+    lr: !!float 2e-5
+    weight_decay: 0
+    betas: [0.9, 0.99]
+  optim_d:
+    type: AdamW
+    lr: !!float 1e-4
+    weight_decay: 0
+    betas: [0.9, 0.99]
+  scheduler:
+    type: MultiStepLR
+    milestones: [2000, 2700]
+    gamma: 0.5
+  total_iter: 3000
+  warmup_iter: 100
+  losses:
+    - type: l1loss
+      loss_weight: 0.01
+    - type: perceptualloss
+      criterion: l1
+      loss_weight: 1.0
+    - type: ganloss
+      gan_type: hinge
+      loss_weight: 0.005
+
+val:
+  val_enabled: true
+  val_freq: 500
+  save_img: true
+  tile_size: 0
+  tile_overlap: 0
+  stochastic_samples: 1
+  stochastic_seed: 0
+  metrics_enabled: true
+  metrics:
+    psnr:
+      type: calculate_psnr
+      crop_border: 2
+      test_y_channel: false
+    ssim:
+      type: calculate_ssim
+      crop_border: 2
+      test_y_channel: false
+
+logger:
+  print_freq: 25
+  save_checkpoint_freq: 500
+  save_checkpoint_format: safetensors
+  use_tb_logger: true

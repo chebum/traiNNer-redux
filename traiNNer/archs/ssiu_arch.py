@@ -4,7 +4,8 @@ The deterministic module names match the locally deployed SSIU checkpoints.
 The optional stochastic paths are initialized to preserve the pretrained
 model's output.  The legacy texture head adds a high-pass RGB residual, while
 deep feature noise gives late SSIU blocks spatial randomness that they can
-turn into structured texture.
+turn into structured texture. Optional ESRGAN+-style paths add two
+zero-initialized cross-stage shortcuts inside every recurrent module.
 """
 
 from __future__ import annotations
@@ -76,6 +77,8 @@ class LearnedFeatureNoise(nn.Module):
         )
         if not enabled:
             return features
+        # One spatial noise field is broadcast through learned per-feature
+        # gains, matching the StyleGAN-like mechanism described by ESRGAN+.
         noise = torch.randn(
             features.shape[0],
             1,
@@ -375,7 +378,7 @@ class SSIU(nn.Module):
             ]
             if invalid_missing or incompatible.unexpected_keys:
                 raise RuntimeError(
-                    "SSIU checkpoint mismatch outside texture_head or optional paths: "
+                    "SSIU checkpoint mismatch outside optional paths: "
                     f"missing={invalid_missing}, "
                     f"unexpected={incompatible.unexpected_keys}"
                 )
@@ -473,11 +476,15 @@ class SSIURecurrentModule(nn.Module):
         attended_input = normalized + sparse + shallow
         attended = self.attention(attended_input) + attended_input
         if self.plus_input_projection is not None:
+            # ESRGAN+ analogue of x2 += conv1x1(x). The zero initialization
+            # exactly preserves a deterministic checkpoint at step zero.
             attended = attended + self.plus_input_projection(normalized)
         if self.residual_noise:
             attended = self.residual_noise[0](attended)
         features = self.aggregate(attended - similar) + similar
         if self.plus_long_skip_gain is not None:
+            # ESRGAN+ analogue of x4 += x2. A learned per-channel zero gate
+            # keeps the pre-existing SSIU function unchanged on initialization.
             features = features + attended * self.plus_long_skip_gain
         if self.residual_noise:
             features = self.residual_noise[1](features)

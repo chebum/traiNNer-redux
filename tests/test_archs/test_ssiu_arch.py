@@ -47,7 +47,7 @@ def test_deterministic_checkpoint_only_misses_texture_head() -> None:
 
     broken_state = dict(deterministic.state_dict())
     broken_state.pop("head.weight")
-    with pytest.raises(RuntimeError, match="outside texture_head"):
+    with pytest.raises(RuntimeError, match="outside optional paths"):
         stochastic.load_state_dict(broken_state, strict=False)
 
 
@@ -169,6 +169,111 @@ def test_zero_gain_deep_noise_preserves_deterministic_checkpoint() -> None:
     stochastic.load_state_dict(deterministic.state_dict(), strict=False)
     value = torch.randn(1, 3, 16, 16)
     assert torch.equal(deterministic(value), stochastic(value))
+
+
+def test_zero_initialized_plus_residuals_preserve_checkpoint_and_rng() -> None:
+    torch.manual_seed(7)
+    deterministic = SSIU(scale=2, n_feats=8, n_blocks=3)
+    state_after_deterministic = torch.random.get_rng_state()
+
+    torch.random.set_rng_state(state_after_deterministic)
+    plus = SSIU(scale=2, n_feats=8, n_blocks=3, plus_residuals=True)
+    state_after_plus = torch.random.get_rng_state()
+
+    # Compare with constructing the same deterministic base model: the added
+    # zero branches must not perturb later discriminator/data RNG state.
+    torch.random.set_rng_state(state_after_deterministic)
+    SSIU(scale=2, n_feats=8, n_blocks=3)
+    assert torch.equal(state_after_plus, torch.random.get_rng_state())
+
+    plus.load_state_dict(deterministic.state_dict(), strict=False)
+    value = torch.randn(1, 3, 16, 16)
+    assert torch.equal(deterministic(value), plus(value))
+
+
+def test_plus_residuals_receive_gradients() -> None:
+    model = SSIU(scale=2, n_feats=8, n_blocks=3, plus_residuals=True)
+    model(torch.randn(1, 3, 16, 16)).square().mean().backward()
+
+    for block in model.body:
+        assert block.plus_input_projection is not None
+        assert block.plus_input_projection.weight.grad is not None
+        assert torch.count_nonzero(block.plus_input_projection.weight.grad) > 0
+        assert block.plus_long_skip_gain is not None
+        assert block.plus_long_skip_gain.grad is not None
+        assert torch.count_nonzero(block.plus_long_skip_gain.grad) > 0
+
+
+def test_feature_noise_is_training_only_and_uses_one_spatial_field() -> None:
+    noise = LearnedFeatureNoise(channels=3, noise_mode="train", init_gain=0.5)
+    value = torch.zeros(1, 3, 8, 8)
+
+    noise.eval()
+    assert torch.equal(noise(value), value)
+
+    noise.train()
+    output = noise(value)
+    assert not torch.equal(output, value)
+    assert torch.equal(output[:, 0], output[:, 1])
+    assert torch.equal(output[:, 1], output[:, 2])
+
+
+def test_internal_residual_noise_is_training_only() -> None:
+    deterministic = SSIU(scale=2, n_feats=8, n_blocks=3)
+    stochastic = SSIU(
+        scale=2,
+        n_feats=8,
+        n_blocks=3,
+        stochastic_internal_residuals=True,
+        noise_mode="train",
+        feature_noise_init_gain=1e-3,
+    )
+    stochastic.load_state_dict(deterministic.state_dict(), strict=False)
+    value = torch.randn(1, 3, 16, 16)
+
+    stochastic.eval()
+    first_eval = stochastic(value)
+    second_eval = stochastic(value)
+    assert torch.equal(first_eval, second_eval)
+    assert torch.equal(first_eval, deterministic.eval()(value))
+
+    stochastic.train()
+    first_train = stochastic(value)
+    second_train = stochastic(value)
+    assert not torch.equal(first_train, second_train)
+    assert sum(len(block.residual_noise) for block in stochastic.body) == 9
+
+
+def test_original_training_checkpoint_names_are_mapped() -> None:
+    model = SSIU(scale=2, n_feats=8, n_blocks=3)
+    original_names = {}
+    reverse_renames = (
+        (".norm.norm.", ".norm.body."),
+        (".sparse_constraint.", ".s1."),
+        (".similarity_constraint.", ".s2."),
+        (".attention.", ".s3."),
+        (".aggregate.", ".s4."),
+        (".feed_forward.", ".ffn."),
+        (".direct.", ".project_in1."),
+        (".local.", ".project_in2."),
+        (".output.", ".project_out."),
+        (".local_propagation.", ".LocalProp."),
+        (".relative_height", ".rel_h"),
+        (".relative_width", ".rel_w"),
+        (".qkv.", ".qkv_conv."),
+        ("moe.weight_a.", "moe.fc_a."),
+        ("moe.weight_b.", "moe.fc_b."),
+        ("moe.weight_c.", "moe.fc_c."),
+    )
+    for runtime_key, value in model.state_dict().items():
+        training_key = runtime_key
+        for runtime_name, training_name in reverse_renames:
+            training_key = training_key.replace(runtime_name, training_name)
+        original_names[f"module.{training_key}"] = value
+
+    mapped = model.map_state_dict(original_names)
+    assert mapped.keys() == model.state_dict().keys()
+    model.load_state_dict(original_names, strict=True)
 
 
 def test_deep_noise_is_seed_dependent_and_gain_receives_gradient() -> None:
