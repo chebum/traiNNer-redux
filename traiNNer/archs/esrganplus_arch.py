@@ -82,7 +82,7 @@ def _conv(
 
 
 class ResidualDenseBlock5C(nn.Module):
-    def __init__(
+    def __init__(  # noqa: PLR0917
         self,
         num_feat: int,
         num_grow_ch: int,
@@ -90,6 +90,7 @@ class ResidualDenseBlock5C(nn.Module):
         noise_mode: NoiseMode,
         noise_style: NoiseStyle,
         noise_init_gain: float,
+        residual_path_init_gain: float | None,
     ) -> None:
         super().__init__()
         self.noise = GaussianNoise(
@@ -101,6 +102,13 @@ class ResidualDenseBlock5C(nn.Module):
         )
         # Bias=False is required for compatibility with the reference model.
         self.conv1x1 = nn.Conv2d(num_feat, num_grow_ch, 1, bias=False)
+        self.residual_path_gain = (
+            nn.Parameter(
+                torch.full((1, num_grow_ch, 1, 1), residual_path_init_gain)
+            )
+            if residual_path_init_gain is not None
+            else None
+        )
         self.conv1 = _conv(num_feat, num_grow_ch)
         self.conv2 = _conv(num_feat + num_grow_ch, num_grow_ch)
         self.conv3 = _conv(num_feat + 2 * num_grow_ch, num_grow_ch)
@@ -109,15 +117,21 @@ class ResidualDenseBlock5C(nn.Module):
 
     def forward(self, x: Tensor) -> Tensor:
         x1 = self.conv1(x)
-        x2 = self.conv2(torch.cat((x, x1), 1)) + self.conv1x1(x)
+        extra = self.conv1x1(x)
+        if self.residual_path_gain is not None:
+            extra = extra * self.residual_path_gain
+        x2 = self.conv2(torch.cat((x, x1), 1)) + extra
         x3 = self.conv3(torch.cat((x, x1, x2), 1))
-        x4 = self.conv4(torch.cat((x, x1, x2, x3), 1)) + x2
+        extra = x2
+        if self.residual_path_gain is not None:
+            extra = extra * self.residual_path_gain
+        x4 = self.conv4(torch.cat((x, x1, x2, x3), 1)) + extra
         x5 = self.conv5(torch.cat((x, x1, x2, x3, x4), 1))
         return self.noise(x + x5 * 0.2)
 
 
 class RRDBPlus(nn.Module):
-    def __init__(
+    def __init__(  # noqa: PLR0917
         self,
         num_feat: int,
         num_grow_ch: int,
@@ -126,6 +140,7 @@ class RRDBPlus(nn.Module):
         noise_style: NoiseStyle,
         noise_init_gain: float,
         noise_after_rrdb: bool,
+        residual_path_init_gain: float | None,
     ) -> None:
         super().__init__()
         args = (
@@ -135,6 +150,7 @@ class RRDBPlus(nn.Module):
             noise_mode,
             noise_style,
             noise_init_gain,
+            residual_path_init_gain,
         )
         # Attribute names preserve ESRGAN+ checkpoint compatibility.
         self.RDB1 = ResidualDenseBlock5C(*args)
@@ -180,6 +196,7 @@ class ESRGANPlus(nn.Module):
         noise_style: NoiseStyle = "multiplicative",
         noise_init_gain: float = 0.001,
         noise_after_rrdb: bool = False,
+        rrdrb_residual_path_init_gain: float | None = None,
     ) -> None:
         super().__init__()
         if scale not in (1, 2, 3, 4, 8):
@@ -194,6 +211,7 @@ class ESRGANPlus(nn.Module):
                 noise_style,
                 noise_init_gain,
                 noise_after_rrdb,
+                rrdrb_residual_path_init_gain,
             )
             for _ in range(num_blocks)
         ]
@@ -231,6 +249,7 @@ class ESRGANPlus(nn.Module):
             "noise_style": noise_style,
             "noise_init_gain": noise_init_gain,
             "noise_after_rrdb": noise_after_rrdb,
+            "rrdrb_residual_path_init_gain": rrdrb_residual_path_init_gain,
         }
 
     def forward(self, x: Tensor) -> Tensor:
