@@ -1,5 +1,5 @@
-# x4 degradation stage initialized from the completed clean x4 adaptation.
-name: 4x_ESRGANplus_calibrated_degradation_full_epoch
+# New degradation recipe initialized from the completed x4 restoration run.
+name: 4x_ESRGANplus_calibrated_degradation_full_epoch_v2
 scale: 4
 use_amp: true
 amp_bf16: true
@@ -27,25 +27,26 @@ datasets:
     accum_iter: 1
     degradation:
       degradation_probability: 0.85
-      kernel_probabilities: {gaussian: 0.55, area: 0.25, kaiser: 0.15, ringing: 0.05}
-      gaussian_sigma: [0.25, 1.6]
-      gaussian_anisotropy: [0.75, 1.25]
-      area_kernel_size: [1, 5]
-      sinc_kernel_size: [7, 15]
-      sinc_cutoff: [0.45, 0.85]
-      kaiser_beta: [6.0, 10.0]
-      ringing_kaiser_beta: [2.5, 5.0]
+      pipeline_version: 2
+      # No isotropic preblur. Resize still performs its normal sampling/filtering.
+      motion_blur_probability: 0.20
+      motion_blur_length: [0.3, 1.2]  # LR pixels; scaled to HR before filtering.
+      pre_resize_jpeg_probability: 0.90
+      pre_resize_jpeg_quality: [15, 65]
+      resize_probabilities: {area: 0.35, bicubic: 0.45, lanczos: 0.20}
       noise_probability: 0.40
       noise_sigma: [0.0, 1.5]
-      jpeg_probability: 0.82
-      double_jpeg_probability: 0.35
-      double_jpeg_quality: [45, 85]
-      jpeg_quality: [75, 100]
+      texture_smoothing_probability: 0.30
+      texture_smoothing_diameter: 7
+      texture_smoothing_sigma_color: [8.0, 30.0]  # On the 0-255 scale.
+      texture_smoothing_sigma_space: [1.0, 2.5]  # LR pixels.
+      # Independent final encode: JPEG->resize and JPEG->resize->JPEG branches.
+      jpeg_probability: 0.65
+      jpeg_quality: [30, 95]
       jpeg_quality_mixture:
-        - {quality: [75, 79], probability: 0.15}
-        - {quality: [90, 92], probability: 0.35}
-        - {quality: [93, 95], probability: 0.37}
-        - {quality: [96, 100], probability: 0.13}
+        - {quality: [30, 55], probability: 0.35}
+        - {quality: [56, 80], probability: 0.45}
+        - {quality: [81, 95], probability: 0.20}
   val:
     name: Full clean x4 held-out validation
     type: pairedimagedataset
@@ -79,9 +80,9 @@ network_d:
   skip_connection: true
 
 path:
-  pretrain_network_g: experiments/4x_ESRGANplus_clean_full_epoch/models/net_g_ema_latest.safetensors
-  pretrain_network_g_ema: experiments/4x_ESRGANplus_clean_full_epoch/models/net_g_ema_latest.safetensors
-  pretrain_network_d: experiments/4x_ESRGANplus_clean_full_epoch/models/resume_models/net_d_latest.safetensors
+  pretrain_network_g: experiments/4x_ESRGANplus_calibrated_degradation_full_epoch/models/net_g_ema_latest.safetensors
+  pretrain_network_g_ema: experiments/4x_ESRGANplus_calibrated_degradation_full_epoch/models/net_g_ema_latest.safetensors
+  pretrain_network_d: experiments/4x_ESRGANplus_calibrated_degradation_full_epoch/models/resume_models/net_d_latest.safetensors
   param_key_g: ~
   param_key_d: ~
   strict_load_g: true

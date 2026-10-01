@@ -52,7 +52,9 @@ def _kaiser_sinc_kernel(size: int, cutoff: float, beta: float) -> np.ndarray:
     return (kernel / kernel.sum()).astype(np.float32)
 
 
-def degrade_image(hr: np.ndarray, scale: int, options: dict[str, Any]) -> np.ndarray:
+def _degrade_legacy_image(
+    hr: np.ndarray, scale: int, options: dict[str, Any]
+) -> np.ndarray:
     """Apply PSF, sampling, sensor noise, and calibrated JPEG compression."""
     height, width = hr.shape[:2]
     if random.random() >= float(options.get("degradation_probability", 1.0)):
@@ -115,6 +117,80 @@ def degrade_image(hr: np.ndarray, scale: int, options: dict[str, Any]) -> np.nda
     if random.random() < float(options["jpeg_probability"]):
         if random.random() < float(options.get("double_jpeg_probability", 0.0)):
             lr = jpeg_roundtrip(lr, random.randint(*options["double_jpeg_quality"]))
+        lr = jpeg_roundtrip(lr, sample_jpeg_quality(options))
+    return lr
+
+
+def motion_blur_kernel(length: float, angle: float) -> np.ndarray:
+    """Rasterize a centered line PSF with fractional-pixel endpoint support."""
+    radius = math.ceil(length / 2) + 1
+    kernel = np.zeros((2 * radius + 1, 2 * radius + 1), dtype=np.float32)
+    positions = np.linspace(-length / 2, length / 2, max(2, math.ceil(length * 16)))
+    radians = math.radians(angle)
+    x = radius + positions * math.cos(radians)
+    y = radius + positions * math.sin(radians)
+    left, top = np.floor(x).astype(int), np.floor(y).astype(int)
+    dx, dy = x - left, y - top
+    for offset_x, offset_y, weights in (
+        (0, 0, (1 - dx) * (1 - dy)),
+        (1, 0, dx * (1 - dy)),
+        (0, 1, (1 - dx) * dy),
+        (1, 1, dx * dy),
+    ):
+        np.add.at(kernel, (top + offset_y, left + offset_x), weights)
+    return kernel / kernel.sum()
+
+
+def degrade_image(hr: np.ndarray, scale: int, options: dict[str, Any]) -> np.ndarray:
+    """Synthesize camera/web degradation; v1 preserves historical run recipes."""
+    version = options.get("pipeline_version", 1)
+    if version == 1:
+        return _degrade_legacy_image(hr, scale, options)
+    if version != 2:
+        raise ValueError(f"Unknown degradation pipeline version: {version}")
+
+    height, width = hr.shape[:2]
+    target_size = (width // scale, height // scale)
+    if random.random() >= float(options.get("degradation_probability", 1.0)):
+        return cv2.resize(hr, target_size, interpolation=cv2.INTER_AREA)
+
+    image = hr
+    if random.random() < float(options["motion_blur_probability"]):
+        # Express strength in output pixels so x2/x4 have comparable softness.
+        length = scale * random.uniform(*options["motion_blur_length"])
+        kernel = motion_blur_kernel(length, random.uniform(0, 180))
+        image = cv2.filter2D(image, -1, kernel, borderType=cv2.BORDER_REFLECT_101)
+
+    if random.random() < float(options["pre_resize_jpeg_probability"]):
+        image = jpeg_roundtrip(
+            image, random.randint(*options["pre_resize_jpeg_quality"])
+        )
+
+    modes = {
+        "area": cv2.INTER_AREA,
+        "bicubic": cv2.INTER_CUBIC,
+        "lanczos": cv2.INTER_LANCZOS4,
+    }
+    probabilities = options["resize_probabilities"]
+    mode = random.choices(
+        list(probabilities), weights=list(probabilities.values()), k=1
+    )[0]
+    lr = cv2.resize(image, target_size, interpolation=modes[mode])
+    if random.random() < float(options["noise_probability"]):
+        sigma = random.uniform(*options["noise_sigma"])
+        noise = RNG.get_rng().normal(0.0, sigma, lr.shape).astype(np.float32)
+        lr = np.clip(lr.astype(np.float32) + noise, 0, 255).astype(np.uint8)
+
+    if random.random() < float(options["texture_smoothing_probability"]):
+        lr = cv2.bilateralFilter(
+            lr,
+            d=int(options["texture_smoothing_diameter"]),
+            sigmaColor=random.uniform(*options["texture_smoothing_sigma_color"]),
+            sigmaSpace=random.uniform(*options["texture_smoothing_sigma_space"]),
+            borderType=cv2.BORDER_REFLECT_101,
+        )
+
+    if random.random() < float(options["jpeg_probability"]):
         lr = jpeg_roundtrip(lr, sample_jpeg_quality(options))
     return lr
 
